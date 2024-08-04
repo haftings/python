@@ -73,10 +73,7 @@ p.add_argument(
 )
 p.add_argument(
     '--open', action='store_true',
-    help=(
-        'open HTML file with default browser, if neither --out or '
-        '--save are set, then --open implies --out=Downloads/'
-    )
+    help='open HTML file with default browser, implies --out or --save'
 )
 a = p.parse_args()
 
