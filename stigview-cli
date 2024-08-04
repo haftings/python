@@ -1,0 +1,67 @@
+#! /usr/bin/env python3
+
+'''Convert manual STIG XML file to text on terminal'''
+
+import argparse
+import html
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+USAGE = usage='%(prog)s *xccdf.xml | less -R'
+JUNK_TAG_PATTERN = re.compile(r'</?VulnDiscussion>|<([a-z_-]+)></\1>', re.I)
+
+# parse arguments
+p = argparse.ArgumentParser(description=__doc__, usage=USAGE)
+p.add_argument('xml', help='manual STIG XML file path')
+a = p.parse_args()
+
+# parse XML
+tree = ET.parse(a.xml)
+root = tree.getroot()
+
+# traverse XML tree
+for group in root:
+    if group.tag.rpartition('}')[-1].lower() != 'group':
+        continue
+    title = description = severity = version = fix = check = ''
+    for rule in group:
+        if rule.tag.rpartition('}')[-1].lower() != 'rule':
+            continue
+        severity = rule.attrib.get('severity', '')
+        for detail in rule:
+            name = detail.tag.rpartition('}')[-1].lower()
+            if name == 'version':
+                version = html.unescape(detail.text)
+            elif name == 'title':
+                title = html.unescape(detail.text)
+            elif name == 'description':
+                description = JUNK_TAG_PATTERN.sub('', html.unescape(detail.text))
+            elif name == 'fixtext':
+                fix = html.unescape(detail.text)
+            elif name == 'check':
+                for check in detail:
+                    if check.tag.rpartition('}')[-1].lower() == 'check-content':
+                        check = html.unescape(check.text)
+    
+    # format text blocks
+    description = ''.join(f'        {line}\n' for line in description.splitlines())
+    fix = ''.join(f'        {line}\n' for line in fix.splitlines())
+    check = ''.join(f'        {line}\n' for line in check.splitlines())
+    
+    # write heading
+    msg = f'{version} ({severity})'
+    if severity.lower() == 'high':
+        sys.stdout.write(f'\033[37;41m{msg}\033[39;49m  ')
+    elif severity.lower() == 'medium':
+        sys.stdout.write(f'\033[30;43m{msg}\033[39;49m  ')
+    elif severity.lower() == 'low':
+        sys.stdout.write(f'\033[30;46m{msg}\033[39;49m  ')
+    else:
+        sys.stdout.write(f'\033[30;45m{msg}\033[39;49m  ')
+    
+    # write details
+    sys.stdout.write(f'\033[1;4m{title}\033[22;24m\n')
+    sys.stdout.write(f'    \033[1mdescription:\033[22m\n{description}\n')
+    sys.stdout.write(f'    \033[1mcheck:\033[22m\n{check}\n')
+    sys.stdout.write(f'    \033[1mfix:\033[22m\n{fix}\n')
