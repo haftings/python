@@ -1,0 +1,183 @@
+#! /usr/bin/env python3
+
+'''Convert manual STIG XML file to an HTML page'''
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import typing
+import xml.etree.ElementTree as ET
+
+USAGE = usage='%(prog)s *xccdf.xml | less -R'
+TAG_PATTERN = re.compile(r'<[^>]*>')
+RE_PRE = re.compile(r'''
+    ^([\ \t]+).*(?:\n\1.*|\n[\ \t]*$)* |
+    ^([\#\$]).*(?:\n.+)* |
+    .+
+''', re.M | re.X)
+N_PATTERN = re.compile(r'\n\n?')
+
+def get_tag(element: ET.Element) -> str:
+    '''Remove XML class noise from tag, and lowercase it'''
+    return element.tag.rpartition('}')[-1].lower()
+
+def xml_to_html(element: ET.Element, nop: bool = False) -> str:
+    '''Sanitize and convert element to HTML'''
+    html = element.text
+    # remove existing (garbage) tags
+    html = TAG_PATTERN.sub('', element.text).rstrip()
+    if nop:
+        return html.strip()
+    # convert to <pre> or <p> as needed
+    parts = []
+    for r in RE_PRE.finditer(html):
+        if r[1]:
+            lines = [line[len(r[1]):].rstrip() for line in r[0].splitlines()]
+            text = '\n'.join(lines)
+            parts.append(f'<pre>{text}</pre>')
+        elif r[2]:
+            text = '\n'.join(line.rstrip() for line in r[0].splitlines())
+            parts.append(f'<pre>{text}</pre>')
+        else:
+            parts.append(f'<p>{r[0].strip()}</p>')
+    return '\n'.join(parts)
+
+class Rule:
+    '''STIG Rule'''
+    def __init__(self) -> None:
+        self.version: str = '-'
+        self.severity: str = '-'
+        self.title: str = ''
+        self.description: str = ''
+        self.fixtext: str = ''
+        self.check: str = ''
+
+# parse arguments
+p = argparse.ArgumentParser(description=__doc__, usage=USAGE)
+p.add_argument(
+    'xml',
+    help='manual STIG xml file path'
+)
+p.add_argument(
+    '--out', '-o', default='-',
+    help=(
+        'html file save path, omit file basename to use original basename with '
+        '.html instead of .xml (default - for stdout)'
+    )
+)
+p.add_argument(
+    '--save', '-s', action='store_const', const='', dest='out',
+    help='equivalent to --out=\'\', saves .html file next to original'
+)
+p.add_argument(
+    '--open', action='store_true',
+    help=(
+        'open HTML file with default browser, if neither --out or '
+        '--save are set, then --open implies --out=Downloads/'
+    )
+)
+a = p.parse_args()
+
+# find paths
+if a.open and a.out == '-':
+    a.out = ''
+if a.out != '-':
+    if a.out not in ('/', '.', '..'):
+        if not a.out.startswith(('/', './', '../')):
+            a.out = os.path.join(os.path.dirname(a.xml) or '.', a.out)
+    if a.out.endswith('/') or os.path.isdir(a.out):
+        basename = re.sub(r'\.[xX][mM][lL]$', '', os.path.basename(a.xml))
+        a.out = os.path.join(a.out, f'{basename}.html')
+
+# parse XML
+tree = ET.parse(a.xml)
+root = tree.getroot()
+stigs: typing.List[Rule] = []
+title = version = release = '-'
+# traverse XML tree
+for group in root:
+    top_tag = get_tag(group)
+    if top_tag == 'group':
+        stig = Rule()
+        for rule in group:
+            if get_tag(rule) == 'rule':
+                stig.severity = rule.attrib.get('severity', '') or '-'
+                for detail in rule:
+                    name = get_tag(detail)
+                    if name == 'version':
+                        stig.version = detail.text
+                    elif name == 'title':
+                        stig.title = xml_to_html(detail, nop=True)
+                    elif name in ('description', 'fixtext'):
+                        setattr(stig, name, xml_to_html(detail))
+                    elif name == 'check':
+                        for check in detail:
+                            if get_tag(check) == 'check-content':
+                                stig.check = xml_to_html(check)
+        if stig.version not in '-':
+            stigs.append(stig)
+    elif top_tag == 'title':
+        title = group.text.strip() or '-'
+    elif top_tag == 'version':
+        version = group.text.strip() or '-'
+    elif top_tag == 'plain-text':
+        if group.attrib.get('id') == 'release-info':
+            release = group.text.strip() or '-'
+
+# start document
+doc = [
+    '<!doctype html>\n<html>\n<head>\n'
+    f'<title>{title}</title>\n'
+    '<style>\n'
+    'html { color: #F1F1F1; background: #080808; font-family:Arial }\n'
+    'body { margin:0; padding:0; }\n'
+    'h1, h2, h3, h4, h5, h6 { margin: 0; padding: 1ex }\n'
+    'div { margin: 0; padding:1em 1ex }\n'
+    'div.rule:nth-child(odd) { background:rgba(127,127,127,0.2) }\n'
+    '.high-severity { color: #da2d2d }\n'
+    '.medium-severity { color: #CBA200 }\n'
+    '.low-severity { color: #5867ba }\n'
+    'table {  border-collapse:collapse }\n'
+    'tr {\n'
+    '  border-top: 1px solid rgba(127,127,127,0.5);\n'
+    '  border-bottom: 1px solid rgba(127,127,127,0.5);\n'
+    '}\n'
+    'th { padding-right: 1ex }\n'
+    'p { margin: 0.5em 0 }\n'
+    '</style>\n'
+    '</head>\n<body>\n'
+    f'<h1>{title}</h2>\n'
+    f'<h3>Version <span id="version">{version}</span>, '
+    f'<span id="release">{release}</span></h3>\n'
+]
+
+# write out STIGs
+for stig in stigs:
+    doc.append(
+        '\n<div class=rule>\n'
+        f'<h2 class="{stig.severity}-severity">'
+        f'<span class="version">{stig.version}</span> '
+        f'(<span class="severity">{stig.severity}</span> severity)'
+        '</h2>\n'
+        f'<h3>{stig.title}</h3>\n'
+        f'<table>\n'
+        f'<tr class="description"><th>description</th><td>\n{stig.description}</td></tr>\n'
+        f'<tr class="check"><th>check</th><td>\n{stig.check}</td></tr>\n'
+        f'<tr class="fixtext"><th>fix</th><td>\n{stig.fixtext}</td></tr>\n'
+        f'</table>\n'
+        '</div>\n\n'
+    )
+
+# finish document
+doc.append('</body>\n</html>\n')
+
+if a.out == '-':
+    sys.stdout.write(''.join(doc))
+else:
+    sys.stderr.write(f'writing {a.out}\n')
+    with open(a.out, 'w') as file:
+        file.write(''.join(doc))
+if a.open:
+    subprocess.run(['open', '--', a.out])
