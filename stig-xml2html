@@ -128,36 +128,117 @@ for group in root:
 
 # start document
 doc = [
-    '<!doctype html>\n<html>\n<head>\n'
-    f'<title>{title}</title>\n'
-    '<style>\n'
-    'html { color: #F1F1F1; background: #080808; font-family:Arial }\n'
-    'body { margin:0; padding:0; }\n'
-    'h1, h2, h3, h4, h5, h6 { margin: 0; padding: 1ex }\n'
-    'div { margin: 0; padding:1em 1ex }\n'
-    'div.rule:nth-child(odd) { background:rgba(127,127,127,0.2) }\n'
-    '.high-severity { color: #da2d2d }\n'
-    '.medium-severity { color: #CBA200 }\n'
-    '.low-severity { color: #5867ba }\n'
-    'table {  border-collapse:collapse }\n'
-    'tr {\n'
-    '  border-top: 1px solid rgba(127,127,127,0.5);\n'
-    '  border-bottom: 1px solid rgba(127,127,127,0.5);\n'
-    '}\n'
-    'th { padding-right: 1ex }\n'
-    'p { margin: 0.5em 0 }\n'
-    '</style>\n'
-    '</head>\n<body>\n'
-    f'<h1>{title}</h2>\n'
-    f'<h3>Version <span id="version">{version}</span>, '
-    f'<span id="release">{release}</span></h3>\n'
+f''''<!doctype html>\n<html>\n<head>\n
+<title>{title}</title>\n
+<style>\n
+html {{ color: #F1F1F1; background: #080808; font-family:Arial }}
+body {{ margin:0; padding:0; }}
+h1, h2, h3, h4, h5, h6 {{ margin: 0; padding: 1ex }}
+.filter-on, .filter-off {{
+    padding: 0.5ex; border-radius: 0.5ex; cursor: pointer;
+}}
+.filter-off {{ background: #888888 }}
+#any-filter.filter-on, #other-filter.filter-on {{ background: #414141 }}
+#high-filter.filter-on {{ background: #da2d2d }}
+#medium-filter.filter-on {{ background: #cba200 }}
+#low-filter.filter-on {{ background: #5867ba }}
+.hidden {{ display: none }}
+div {{ margin: 0; padding:1em 1ex }}
+div.rule:nth-child(odd) {{ background:rgba(127,127,127,0.2) }}
+.high-severity>h2 {{ color: #da2d2d }}
+.medium-severity>h2 {{ color: #cba200 }}
+.low-severity>h2 {{ color: #5867ba }}
+.other-severity>h2 {{ color: #5867ba }}
+table {{  border-collapse:collapse }}
+tr {{
+  border-top: 1px solid rgba(127,127,127,0.5);
+  border-bottom: 1px solid rgba(127,127,127,0.5);
+}}
+th {{ padding-right: 1ex }}
+p {{ margin: 0.5em 0 }}
+</style>\n
+</head>\n<body>\n
+<h1>{title}</h2>\n
+<h3>
+  Version <span id="version">{version}</span>,
+  <span id="release">{release}</span>
+</h3>
+<hr />
+<div class="filters">
+  Filter by severity:
+  <span class="filter-on" id="any-filter">Any</span>
+  <span class="filter-on" id="high-filter">High</span>
+  <span class="filter-on" id="medium-filter">Medium</span>
+  <span class="filter-on" id="low-filter">Low</span>
+  <span class="filter-on" id="other-filter">Other</span>
+</div>
+<hr />
+<script>
+    set_visibilities = (name) => {{
+        let e = {{
+            'any': document.getElementById('any-filter'),
+            'high': document.getElementById('high-filter'),
+            'medium': document.getElementById('medium-filter'),
+            'low': document.getElementById('low-filter'),
+            'other': document.getElementById('other-filter'),
+        }}
+        let show = {{
+            'high': e.high.classList.contains('filter-on'),
+            'medium': e.medium.classList.contains('filter-on'),
+            'low': e.low.classList.contains('filter-on'),
+            'other': e.other.classList.contains('filter-on')
+        }}
+        show[name] = !show[name];
+        e[name].className = show[name] ? 'filter-on' : 'filter-off';
+        if (name == 'any') {{
+            let show_any = e.any.classList.contains('filter-on');
+            for (const n of ['high', 'medium', 'low', 'other']) {{
+                show[n] = show_any;
+                e[n].className = show_any ? 'filter-on' : 'filter-off';
+            }}
+        }} else if (!show[name]) {{
+            e.any.className = 'filter-off';
+        }} else if (show.high && show.medium && show.low && show.other) {{
+            e.any.className = 'filter-on';
+        }}
+        for (const e of document.getElementsByClassName('rule')) {{
+            console.log(e.classList.add);
+            let kind = (
+                e.classList.contains('high-severity') ? 'high' :
+                e.classList.contains('medium-severity') ? 'medium' :
+                e.classList.contains('low-severity') ? 'low' :
+                'other'
+            );
+            if (show[kind]) e.classList.remove('hidden');
+            else e.classList.add('hidden');
+        }}
+    }}
+    document.getElementById('any-filter').onclick = () => {{
+        set_visibilities('any');
+    }};
+    document.getElementById('high-filter').onclick = () => {{
+        set_visibilities('high');
+    }};
+    document.getElementById('medium-filter').onclick = () => {{
+        set_visibilities('medium');
+    }};
+    document.getElementById('low-filter').onclick = () => {{
+        set_visibilities('low');
+    }};
+    document.getElementById('other-filter').onclick = () => {{
+        set_visibilities('other');
+    }};
+</script>
+'''
 ]
 
 # write out STIGs
+SEVERITIES = 'high', 'medium', 'low'
 for stig in stigs:
+    severity = stig.severity if stig.severity in SEVERITIES else 'other'
     doc.append(
-        '\n<div class=rule>\n'
-        f'<h2 class="{stig.severity}-severity">'
+        f'\n<div class="rule {severity}-severity">\n'
+        '<h2>'
         f'<span class="version">{stig.version}</span> '
         f'(<span class="severity">{stig.severity}</span> severity)'
         '</h2>\n'
