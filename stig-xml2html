@@ -89,7 +89,11 @@ if a.out != '-':
         a.out = os.path.join(a.out, f'{basename}.html')
 
 # parse XML
-tree = ET.parse(a.xml)
+try:
+    tree = ET.parse(a.xml)
+except OSError as e:
+    sys.stderr.write(f'error reading {a.xml}: {e.strerror}\n')
+    sys.exit(e.errno)
 root = tree.getroot()
 stigs: typing.List[Rule] = []
 title = version = release = '-'
@@ -125,7 +129,7 @@ for group in root:
 
 # start document
 doc = [
-f''''<!doctype html>\n<html>\n<head>\n
+f'''<!doctype html>\n<html>\n<head>\n
 <title>{title}</title>\n
 <style>\n
 html {{ color: #F1F1F1; background: #080808; font-family:Arial }}
@@ -255,7 +259,11 @@ if a.out == '-':
     sys.stdout.write(''.join(doc))
 else:
     sys.stderr.write(f'writing {a.out}\n')
-    with open(a.out, 'w') as file:
-        file.write(''.join(doc))
+    try:
+        with open(a.out, 'w') as file:
+            file.write(''.join(doc))
+    except OSError as e:
+        sys.stderr.write(f'error writing {a.out}: {e.strerror}\n')
+        sys.exit(e.errno)
 if a.open:
-    subprocess.run(['open', '--', a.out])
+    sys.exit(subprocess.run(['open', '--', a.out]).returncode)
