@@ -1,0 +1,311 @@
+#! /usr/bin/env python3
+
+'''Convert SCAP CKL file to HTML (or JSON) file (view only)'''
+
+# Feature wish list:
+#  - Editing and saving CKL results (statuses, details, comments, overrides)
+#  - Conversion from XCCDF (manual or results) to CKL or HTML/JSON
+#  - Better JSON / debugging API
+
+import argparse
+import json
+import re
+import sys
+import typing
+import xml.etree.ElementTree
+
+RULE_TYPE = dict[str, str]
+RE_HEADER = re.compile(br'\s*(<[?!][^>]*>\s*)*')
+RE_AUTO = re.compile(r'^Tool:.*:.*\n\s*Time:.*\n\s*Result:', re.I | re.M)
+RE_NOT_REVIEWED = re.compile(r'^\s*(?:not|un)[ ._-]?reviewed\s*$', re.I)
+RE_PRE = re.compile(r'''
+    ^([\ \t]+).*(?:\n\1.*|\n[\ \t]*$)* |
+    ^([\#\$]).*(?:\n.+)* |
+    .+
+''', re.M | re.X)
+RE_TAG = re.compile(r'<[^>]*>')
+SEVERITIES = {'high', 'medium', 'low'}
+STATUS_MAP: dict[str, str] = {
+    'Open': 'Open',
+    'NotAFinding': 'Not a Finding',
+    'Not_Reviewed': 'Not Reviewed',
+    'Not_Applicable': 'Not Applicable'
+}
+TITLE_SUBS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r'Security Technical Implementation Guide', re.I), r'STIG'),
+    (re.compile(r'Red Hat Enterprise Linux(?: ?(\d\d?)\b)', re.I), r'RHEL\1')
+]
+
+DOC_TEMPLATE = '''<!doctype html>
+<html>
+  <head>
+    <title>{short_title}</title>
+    <style>
+
+      html {{ color: #f1f1f1; background: #080808; font-family: Arial; }}
+      body {{ margin:0; padding:0; }}
+      div {{ margin: 0; padding:1em 1ex; }}
+      h1, h2, h3, h4, h5, h6 {{ margin: 0; padding: 0.5ex; }}
+      p {{ margin: 0.5em 0; }}
+      .hidden {{ display: none; }}
+
+      .clickable, .folder {{ margin: 0; padding: 0; }}
+      .clickable:hover {{ cursor: pointer; background: #06416b; }}
+      .button {{ padding: 0.5ex; border-radius: 0.2em; line-height: 2; cursor: pointer; }}
+
+      .filter {{ background: #888888; }}
+      .filter.on[data-type=severity][data-value=high] {{ background: #f82323; }}
+      .filter.on[data-type=severity][data-value=medium] {{ background: #ebbb00; }}
+      .filter.on[data-type=severity][data-value=low] {{ background: #818114; }}
+      .filter.on[data-type=status][data-value=open] {{ background: #f82323 }}
+      .filter.on[data-type=status][data-value=notafinding] {{ background: #2a8351 }}
+      .filter.on[data-type=status][data-value=not-reviewed] {{ background: purple }}
+      .filter.on[data-type=status][data-value=not-applicable] {{ background: #555555 }}
+
+      .rule[data-status=open][data-severity=high] h2 {{ color: #f82323; }}
+      .rule[data-status=open][data-severity=medium] h2 {{ color: #ebbb00; }}
+      .rule[data-status=open][data-severity=low] h2 {{ color: #818114; }}
+      .rule[data-status=notafinding] h2 {{ color: #2a8351; }}
+      .rule[data-status=not-reviewed] h2 {{ color: purple; }}
+      .rule[data-status=not-applicable] h2 {{ color: #555555; }}
+      .rule:nth-child(odd) {{ background:rgba(127,127,127,0.2); }}
+      .rule.collapsed>.fold {{ height: 0; overflow-y: hidden; }}
+
+      .rule table {{ border-collapse:collapse; }}
+      tr {{ border-top: 1px solid rgba(127,127,127,0.5); border-bottom: 1px solid rgba(127,127,127,0.5); }}
+      th {{ padding-right: 1ex; }}
+
+    </style>
+    <script>
+
+      filter = (element) => {{
+        // set this filter
+        element.classList.toggle('on')
+        // read all filters
+        let filters = {{'severity': {{}}, 'status': {{}}}}
+        for (const element of document.getElementsByClassName('filter')) {{
+          filters[element.dataset.type][element.dataset.value] = element.classList.contains('on')
+        }}
+        console.log(filters)
+        // set rules' hidden class accordingly
+        for (const rule of document.getElementsByClassName('rule')) {{
+          if (filters.severity[rule.dataset.severity] && filters.status[rule.dataset.status]) {{
+            rule.classList.remove('hidden')
+          }} else {{
+            rule.classList.add('hidden')
+          }}
+        }}
+      }}
+
+      expand_all = () => {{
+        for (const e of document.getElementsByClassName('clickable')) e.parentElement.classList.remove('collapsed')
+      }}
+      collapse_all = () => {{
+        for (const e of document.getElementsByClassName('clickable')) e.parentElement.classList.add('collapsed')
+      }}
+
+    </script>
+  </head>
+
+  <body>
+    <h1>{title}</h2>
+    <h3>Version <span id="version">{version}</span>, <span id="release">{release}</span></h3>
+    <hr />
+    <table class="filters">
+      <tr>
+        <th>Filter by severity:</th>
+        <td>
+          <span class="filter button on" onclick="filter(this)" data-type="severity" data-value="high">High</span>
+          <span class="filter button on" onclick="filter(this)" data-type="severity" data-value="medium">Medium</span>
+          <span class="filter button on" onclick="filter(this)" data-type="severity" data-value="low">Low</span>
+        </td>
+      </tr>
+      <tr>
+        <th>Filter by status:</th>
+        <td>
+          <span class="filter button on" onclick="filter(this)" data-type="status" data-value="open">Open</span>
+          <span class="filter button on" onclick="filter(this)" data-type="status" data-value="notafinding">Not a Finding</span>
+          <span class="filter button on" onclick="filter(this)" data-type="status" data-value="not-reviewed">Not Reviewed</span>
+          <span class="filter button on" onclick="filter(this)" data-type="status" data-value="not-applicable">Not Applicable</span>
+        </td>
+      </tr>
+      <tr>
+        <th>Quick actions:</th>
+        <td>
+          <span class="button" onclick="expand_all()">Expand All</span>
+          <span class="button" onclick="collapse_all()">Collapse All</span>
+        </td>
+      </tr>
+    </table>
+    <hr />
+'''
+
+RULE_TEMPLATE = '''
+    <div class="rule collapsed" data-severity="{severity}" data-status="{status}">
+      <div class="clickable" onclick="this.parentElement.classList.toggle('collapsed')">
+        <h2>
+          <span class="status status-{status}">{status_text}</span>:
+          <span class="version">{version}</span> / <span class="number">{number}</span>
+          (<span class="severity severity-{severity}">{severity_tag}</span> severity)
+        </h2>
+        <h3>{title}</h3>
+      </div>
+      <div class="folder fold">
+        <table>
+          <tr class="description">
+            <th>description</th>
+            <td>
+              {description}
+            </td>
+          </tr>
+          <tr class="check">
+            <th>check</th>
+            <td>
+              {check}
+            </td>
+          </tr>
+          <tr class="fix">
+            <th>fix</th>
+            <td>
+              {fix}
+            </td>
+          </tr>
+          <tr class="details">
+            <th>finding details</th>
+            <td>
+              {details}
+            </td>
+          </tr>
+          <tr class="comments">
+            <th>comments</th>
+            <td>
+              {comments}
+            </td>
+          </tr>
+        </table>
+      </div>
+    </div>
+'''.lstrip('\n')
+
+
+def text2html(text: str, indent: str = '              ') -> str:
+    '''Sanitize and convert element to HTML'''
+    # remove existing (garbage) tags
+    html = RE_TAG.sub('', text).rstrip()
+    # convert to <pre> or <p> as needed
+    parts = []
+    for r in RE_PRE.finditer(html):
+        if r[1]:
+            lines = [line[len(r[1]):].rstrip() for line in r[0].splitlines()]
+            text = '\n'.join(lines)
+            parts.append(f'<pre>{text}</pre>')
+        elif r[2]:
+            text = '\n'.join(line.rstrip() for line in r[0].splitlines())
+            parts.append(f'<pre>{text}</pre>')
+        else:
+            parts.append(f'<p>{r[0].strip()}</p>')
+    return f'\n{indent}'.join(parts)
+
+
+def parse_ckl(path: str) -> dict[str, dict[str, typing.Union[str, RULE_TYPE]]]:
+    '''Parse a CKL file to JSON-compatible structure'''
+    # read XML
+    x = xml.etree.ElementTree.parse(path)
+    # extract asset
+    asset: dict[str, str] = {
+        element.tag: element.text.strip()
+        for element in x.find('ASSET')
+        if (element.text or '').strip()
+    }
+    # extract info
+    info: dict[str, str] = {}
+    element = x.find('STIGS').find('iSTIG').find('STIG_INFO')
+    for e in element.iterfind('SI_DATA'):
+        key = e.find('SID_NAME').text.strip()
+        e_data = e.find('SID_DATA')
+        value = '' if e_data is None else e_data.text or ''
+        info[key] = value if value.strip() else ''
+    # extract stigs
+    rules: dict[str, dict[str, str]] = {}
+    for element in x.find('STIGS').find('iSTIG').iterfind('VULN'):
+        rule: dict[str, str] = {}
+        for e in element:
+            if e.tag == 'STIG_DATA':
+                key = e.find('VULN_ATTRIBUTE').text.strip()
+                e_data = e.find('ATTRIBUTE_DATA')
+                value = '' if e_data is None else e_data.text or ''
+                rule[key] = value if value.strip() else ''
+            else:
+                rule[e.tag] = e.text if (e.text or '').strip() else ''
+        rules[rule['Rule_Ver']] = rule
+    return {'asset': asset, 'info': info, 'rules': rules}
+
+
+def ckl2html(ckl) -> str:
+    '''Convert CKL file to HTML'''
+    asset, info, rules = ckl['asset'], ckl['info'], ckl['rules']
+    # get a more concise title
+    host = asset['HOST_NAME'].lower().strip() or 'server'
+    title = info['title'] or 'Security Technical Implementation Guide'
+    short_title = f'{host} {title} CKL'
+    title = f'<code>{host}</code> checklist for {title}'
+    for pattern, sub in TITLE_SUBS:
+        short_title = pattern.sub(sub, short_title)
+    # start document
+    doc = [DOC_TEMPLATE.format(
+        title = title,
+        short_title = short_title,
+        version = info['version'] or '-',
+        release = info['releaseinfo'] or '-'
+    )]
+    # write rules
+    for rule in rules.values():
+        severity = rule['Severity'].strip() or 'high'
+        severity_tag = severity if severity in SEVERITIES else 'high'
+        if rule['SEVERITY_OVERRIDE']:
+            new_severity = rule['SEVERITY_OVERRIDE'].strip() or severity
+            if new_severity != severity:
+                new_tag = new_severity if new_severity in SEVERITIES else 'high'
+                severity_tag = f'{severity_tag} overridden to {new_tag}'
+                severity = new_severity
+        status = rule['STATUS']
+        doc.append(RULE_TEMPLATE.format(
+            severity = severity,
+            severity_tag = severity_tag,
+            status=status.lower().replace('_', '-'),
+            status_text = STATUS_MAP.get(status, f'<code>{status}</code>'),
+            version = rule['Rule_Ver'],
+            number = rule['Vuln_Num'],
+            title = rule['Rule_Title'],
+            description = text2html(rule['Vuln_Discuss']),
+            check = text2html(rule['Check_Content']),
+            fix = text2html(rule['Fix_Text']),
+            details = text2html(rule['FINDING_DETAILS'] or ''),
+            comments = text2html(rule['COMMENTS'] or '')
+        ))
+    doc.append('  </body>\n</html>\n')
+    return '\n'.join(doc)
+
+def main():
+    '''Run script'''
+    # args
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('source', help='source ckl file to convert')
+    p.add_argument('destination', nargs='?', default='-', help='file to which to save HTML/JSON')
+    p.add_argument('-j', '--json', action='store_true', help='output JSON instead of HTML')
+    a = p.parse_args()
+    # parse
+    ckl = parse_ckl(a.source)
+    if a.json:
+        output = json.dumps(ckl, indent=2, separators=(',', ': ')) + '\n'
+    else:
+        output = ckl2html(ckl)
+    if a.destination in '-':
+        sys.stdout.write(output)
+    else:
+        with open(a.destination, 'w') as file:
+            file.write(output)
+
+
+if __name__ == '__main__':
+    main()
