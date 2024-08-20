@@ -1,0 +1,159 @@
+#! /usr/bin/env python3
+
+'''Merge existing SCAP CKL file results into newly created CKL file
+
+  - manually reviewed content replaces automatic SCAP content
+  - reviewed content replaces unreviewed content
+  - any content replaces empty unreviewed content
+'''
+
+import argparse
+import xml.etree.ElementTree
+import re
+import sys
+
+
+RE_HEADER = re.compile(br'\s*(<[?!][^>]*>\s*)*')
+RE_AUTO = re.compile(r'^Tool:.*:.*\n\s*Time:.*\n\s*Result:', re.I | re.M)
+RE_NOT_REVIEWED = re.compile(r'^\s*(?:not|un)[ ._-]?reviewed\s*$', re.I)
+
+
+class Vulnerability:
+    '''Vulnerability element'''
+
+    def __init__(self, element: xml.etree.ElementTree.Element):
+        self.element = element
+
+    @property
+    def version(self) -> str:
+        '''Vulnerability version, which is usually a semi-unique identifier'''
+        return next(
+            data.find('ATTRIBUTE_DATA').text
+            for data in self.element.iterfind('STIG_DATA')
+            if data.find('VULN_ATTRIBUTE').text.lower() == 'rule_ver'
+        )
+
+    @property
+    def status(self) -> str:
+        '''Vulnerability status'''
+        return self.element.find('STATUS').text or ''
+    @status.setter
+    def status(self, value: str):
+        self.element.find('STATUS').text = value or None
+
+    @property
+    def details(self) -> str:
+        '''Vulnerability detauls'''
+        return self.element.find('FINDING_DETAILS').text or ''
+    @details.setter
+    def details(self, value: str):
+        self.element.find('FINDING_DETAILS').text = value or None
+
+    @property
+    def comments(self) -> str:
+        '''Vulnerability comments'''
+        return self.element.find('COMMENTS').text or ''
+    @comments.setter
+    def comments(self, value: str):
+        self.element.find('COMMENTS').text = value or None
+
+    @property
+    def reviewed(self) -> bool:
+        '''True if `status` indicates that this vulnerability was reviewed'''
+        return not RE_NOT_REVIEWED.match(self.status)
+    
+    @property
+    def auto(self) -> bool:
+        '''True if `details` appear to be auto-generated'''
+        return bool(RE_AUTO.search(self.details))
+    
+    @property
+    def manual(self) -> bool:
+        '''Info exists and `details` do not appear to be auto-generated'''
+        return (self.status or self.details or self.comments) and not self.auto
+    
+
+def merge_ckl(
+    source_tree: xml.etree.ElementTree.Element,
+    target_tree: xml.etree.ElementTree.Element,
+    ip_mac: bool = True
+) -> xml.etree.ElementTree.Element:
+    '''Merge CKL lists'''
+    # copy IP and MAC addresses
+    if ip_mac:
+        for att in ('IP', 'MAC'):
+            value = source_tree.find('ASSET').find(f'HOST_{att}').text
+            if value:
+                target_tree.find('ASSET').find(f'HOST_{att}').text = value
+    # read source vulnerabilities
+    source_results = {}
+    for element in source_tree.find('STIGS').find('iSTIG').iterfind('VULN'):
+        source = Vulnerability(element)
+        source_results[source.version] = source
+    # loop over target vulnerabilities
+    for element in target_tree.find('STIGS').find('iSTIG').iterfind('VULN'):
+        target = Vulnerability(element)
+        if target.version in source_results:
+            source = source_results[target.version]
+            # manually reviewed content replaces automatic SCAP content
+            # reviewed content replaces unreviewed content
+            if source.reviewed and (
+                (source.manual and target.auto) or not target.reviewed
+            ):
+                target.status = source.status or target.status
+                target.details = source.details or target.details
+                target.comments = source.comments or target.comments
+            # any content replaces empty unreviewed content
+            elif not target.reviewed:
+                target.status = target.status or source.status
+                target.details = target.details or source.details
+                target.comments = target.comments or source.comments
+
+
+def main():
+    '''Run script'''
+    p = argparse.ArgumentParser(description=__doc__)
+    p.formatter_class = argparse.RawDescriptionHelpFormatter
+    p.add_argument(
+        'source', help=(
+            'source xml file to copy content from, '
+            'usually and older CKL with manual STIGs already filled out'
+        )
+    )
+    p.add_argument(
+        'target', help=(
+            'target xml file to copy content into, '
+            'usually a newer auto-generated CKL without manual STIGs filled out'
+        )
+    )
+    p.add_argument(
+        '-i', '--ip', action='store_true', default=True,
+        help='copy IP & MAC address from source to target (this is the default)'
+    )
+    p.add_argument(
+        '-I', '--no-ip', action='store_false', dest='ip',
+        help='leave target IP & MAC address alone'
+    )
+    a = p.parse_args()
+    print(f'{a = }')
+    with open(a.source, 'rb') as file:
+        data = file.read()
+    r = RE_HEADER.match(data)
+    if r:
+        head, data = r[0], data[r.end():]
+    else:
+        head = b''
+    source = xml.etree.ElementTree.fromstring(data)
+    target = xml.etree.ElementTree.parse(a.target)
+    merge_ckl(source, target)
+    if a.destination == '-':
+        sys.stdout.buffer.write(head)
+        target.write(sys.stdout.buffer, short_empty_elements=False)
+    else:
+        with open(a.destination or a.target, 'wb') as file:
+            file.write(head)
+            target.write(file, short_empty_elements=False)
+
+
+if __name__ == '__main__':
+    main()
