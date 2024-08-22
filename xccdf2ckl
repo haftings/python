@@ -1,6 +1,6 @@
 #! /usr/bin/env python3
 
-'''Convert XCCDF results file to a CKL checklist'''
+'''Convert XCCDF format manual STIG and SCAP results files to a CKL checklist'''
 
 import argparse
 import os
@@ -21,9 +21,65 @@ def main():
 	'''Run script'''
 	# parse args
 	p = argparse.ArgumentParser(description=__doc__)
-	p.add_argument('manual', help='Manual XCCDF file to read')
-	p.add_argument('scan', help='benchmark session XCCDF file to read')
-	p.add_argument('destination', nargs='?', default='', help='CKL file to write')
+	p.usage = '%(prog)s [-h | --help] [...] manual scan [destination]'
+	p.add_argument(
+		'manual',
+		help='Manual XCCDF file to read'
+	)
+	p.add_argument(
+		'scan',
+		help='benchmark session XCCDF file to read'
+	)
+	p.add_argument(
+		'destination', nargs='?', default='',
+		help='CKL file to write'
+	)
+	p.add_argument(
+		'--marking', metavar='', default='CUI', help=(
+			'marking for resulting CKL file (default %(default)s), '
+			'usually be set alongside --classification and --class'
+		)
+	)
+	p.add_argument(
+		'--classification', metavar='', default='UNCLASSIFIED', help=(
+			'system classification level (default %(default)s), '
+			'usually be set alongside --marking and --class'
+		)
+	)
+	p.add_argument(
+		'--class', default='Unclass', help=(
+			'classification level abbreviation (default %(default)s), '
+			'usually be set alongside --marking and --classification'
+		)
+	)
+	p.add_argument(
+		'--asset-type', metavar='', default='Computing',
+		help='asset type being scanned (default %(default)s)'
+	)
+	p.add_argument(
+		'--target-comment', metavar='', default='',
+		help='target comment for this scan (default \'\')'
+	)
+	p.add_argument(
+		'--tech-area', metavar='', default='',
+		help='tech area for scan (default \'\')'
+	)
+	p.add_argument(
+		'--web-or-database', metavar='', default='false',
+		help='is this a website or database? (default %(default)s)'
+	)
+	p.add_argument(
+		'--web-db-site', metavar='', default='',
+		help='website or database site (default \'\')'
+	)
+	p.add_argument(
+		'--web-db-instance', metavar='', default='',
+		help='website or database instance (default \'\')'
+	)
+	p.add_argument(
+		'--uuid', metavar='', default='',
+		help='UUID for this scan (default \'\')'
+	)
 	a = p.parse_args()
 	# read XCCDF XML
 	stig = xml.etree.ElementTree.parse(a.manual)
@@ -57,18 +113,18 @@ def main():
 <CHECKLIST>
 	<ASSET>
 		<ROLE>{info.get('role', [None])[0]}</ROLE>
-		<ASSET_TYPE>Computing</ASSET_TYPE>
-		<MARKING>CUI</MARKING>
+		<ASSET_TYPE>{a.asset_type}</ASSET_TYPE>
+		<MARKING>{a.marking}</MARKING>
 		<HOST_NAME>{info.get('host_name', [None])[0]}</HOST_NAME>
 		<HOST_IP>{ip}</HOST_IP>
 		<HOST_MAC>{mac}</HOST_MAC>
 		<HOST_FQDN>{info.get('fqdn', [None])[0]}</HOST_FQDN>
-		<TARGET_COMMENT></TARGET_COMMENT>
-		<TECH_AREA></TECH_AREA>
+		<TARGET_COMMENT>{a.target_comment}</TARGET_COMMENT>
+		<TECH_AREA>{a.tech_area}</TECH_AREA>
 		<TARGET_KEY>{id}</TARGET_KEY>
-		<WEB_OR_DATABASE>false</WEB_OR_DATABASE>
-		<WEB_DB_SITE></WEB_DB_SITE>
-		<WEB_DB_INSTANCE></WEB_DB_INSTANCE>
+		<WEB_OR_DATABASE>{a.web_or_database}</WEB_OR_DATABASE>
+		<WEB_DB_SITE>{a.web_db_site}</WEB_DB_SITE>
+		<WEB_DB_INSTANCE>{a.web_db_instance}</WEB_DB_INSTANCE>
 	</ASSET>
 	<STIGS>
 		<iSTIG>
@@ -79,7 +135,7 @@ def main():
 				</SI_DATA>
 				<SI_DATA>
 					<SID_NAME>classification</SID_NAME>
-					<SID_DATA>UNCLASSIFIED</SID_DATA>
+					<SID_DATA>{a.classification}</SID_DATA>
 				</SI_DATA>
 				<SI_DATA>
 					<SID_NAME>customname</SID_NAME>
@@ -106,11 +162,11 @@ def main():
 				</SI_DATA>
 				<SI_DATA>
 					<SID_NAME>uuid</SID_NAME>
-					<SID_DATA></SID_DATA>
+					<SID_DATA>{a.uuid}</SID_DATA>
 				</SI_DATA>
 				<SI_DATA>
 					<SID_NAME>notice</SID_NAME>
-					<SID_DATA>terms-of-use</SID_DATA>
+					<SID_DATA>{stig.find('notice').attrib['id']}</SID_DATA>
 				</SI_DATA>
 				<SI_DATA>
 					<SID_NAME>source</SID_NAME>
@@ -234,7 +290,7 @@ def main():
 				</STIG_DATA>
 				<STIG_DATA>
 					<VULN_ATTRIBUTE>Class</VULN_ATTRIBUTE>
-					<ATTRIBUTE_DATA>Unclass</ATTRIBUTE_DATA>
+					<ATTRIBUTE_DATA>{a.class_abbreviation}</ATTRIBUTE_DATA>
 				</STIG_DATA>
 				<STIG_DATA>
 					<VULN_ATTRIBUTE>STIGRef</VULN_ATTRIBUTE>
@@ -246,7 +302,7 @@ def main():
 				</STIG_DATA>
 				<STIG_DATA>
 					<VULN_ATTRIBUTE>STIG_UUID</VULN_ATTRIBUTE>
-					<ATTRIBUTE_DATA></ATTRIBUTE_DATA>
+					<ATTRIBUTE_DATA>{a.uuid}</ATTRIBUTE_DATA>
 				</STIG_DATA>
 				<STIG_DATA>
 					<VULN_ATTRIBUTE>LEGACY_ID</VULN_ATTRIBUTE>
