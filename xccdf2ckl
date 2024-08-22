@@ -1,0 +1,277 @@
+#! /usr/bin/env python3
+
+'''Convert XCCDF results file to a CKL checklist'''
+
+import argparse
+import os
+import re
+import sys
+import xml.etree.ElementTree
+
+RE_AMP = re.compile(r'&(?!#[0-9]+;|[A-Za-z0-9]+;)')
+
+
+def to_text(element: xml.etree.ElementTree.Element) -> str:
+	'''Convert XML element to it's escaped text'''
+	text = element.text or ''
+	return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
+def main():
+	'''Run script'''
+	# parse args
+	p = argparse.ArgumentParser(description=__doc__)
+	p.add_argument('manual', help='Manual XCCDF file to read')
+	p.add_argument('scan', help='benchmark session XCCDF file to read')
+	p.add_argument('destination', nargs='?', default='', help='CKL file to write')
+	a = p.parse_args()
+	# read XCCDF XML
+	stig = xml.etree.ElementTree.parse(a.manual)
+	scan = xml.etree.ElementTree.parse(a.scan)
+	# remove XMLNS namespaces
+	for root in (stig, scan):
+		for e in root.iter():
+			e.tag = e.tag.rpartition('}')[2]
+	# parse <TestResult><target-facts>
+	info = {}
+	test_result = scan.find('TestResult')
+	for e in test_result.find('target-facts'):
+		name = e.attrib['name'].rpartition(':')[2]
+		info.setdefault(name, []).append(e.text)
+	iface, ip, mac = 'lo', '127.0.0.1', '00:00:00:00:00:00'
+	for iface, ip, mac in zip(info['interface_name'], info['ipv4'], info['mac']):
+		if iface != 'lo' and ip != '127.0.0.1':
+			if mac.replace('0', '').replace(':', ''):
+				break
+	# pre-make boiler plate values
+	version = int(scan.find('version').text.partition('.')[0], 10)
+	release_info = stig.find('plain-text[@id="release-info"]').text
+	stigref = f"{stig.find('title').text} :: Version {version}, {release_info}"
+	id = scan.find('Group/Rule/reference/identifier').text
+	details_prefix = f"Tool: {test_result.attrib['test-system']}\n"
+	details_prefix += f"Time: {test_result.attrib['end-time']}\nResult: "
+	# start writing document
+	doc = []
+	doc.append(f'''<?xml version="1.0" encoding="UTF-8"?>
+<!--xccdf2ckl :: 0.0-->
+<CHECKLIST>
+	<ASSET>
+		<ROLE>{info.get('role', [None])[0]}</ROLE>
+		<ASSET_TYPE>Computing</ASSET_TYPE>
+		<MARKING>CUI</MARKING>
+		<HOST_NAME>{info.get('host_name', [None])[0]}</HOST_NAME>
+		<HOST_IP>{ip}</HOST_IP>
+		<HOST_MAC>{mac}</HOST_MAC>
+		<HOST_FQDN>{info.get('fqdn', [None])[0]}</HOST_FQDN>
+		<TARGET_COMMENT></TARGET_COMMENT>
+		<TECH_AREA></TECH_AREA>
+		<TARGET_KEY>{id}</TARGET_KEY>
+		<WEB_OR_DATABASE>false</WEB_OR_DATABASE>
+		<WEB_DB_SITE></WEB_DB_SITE>
+		<WEB_DB_INSTANCE></WEB_DB_INSTANCE>
+	</ASSET>
+	<STIGS>
+		<iSTIG>
+			<STIG_INFO>
+				<SI_DATA>
+					<SID_NAME>version</SID_NAME>
+					<SID_DATA>{version}</SID_DATA>
+				</SI_DATA>
+				<SI_DATA>
+					<SID_NAME>classification</SID_NAME>
+					<SID_DATA>UNCLASSIFIED</SID_DATA>
+				</SI_DATA>
+				<SI_DATA>
+					<SID_NAME>customname</SID_NAME>
+				</SI_DATA>
+				<SI_DATA>
+					<SID_NAME>stigid</SID_NAME>
+					<SID_DATA>{stig.getroot().attrib['id']}</SID_DATA>
+				</SI_DATA>
+				<SI_DATA>
+					<SID_NAME>description</SID_NAME>
+					<SID_DATA>{scan.find('description').text}</SID_DATA>
+				</SI_DATA>
+				<SI_DATA>
+					<SID_NAME>filename</SID_NAME>
+					<SID_DATA>{os.path.basename(a.manual)}</SID_DATA>
+				</SI_DATA>
+				<SI_DATA>
+					<SID_NAME>releaseinfo</SID_NAME>
+					<SID_DATA>{release_info}</SID_DATA>
+				</SI_DATA>
+				<SI_DATA>
+					<SID_NAME>title</SID_NAME>
+					<SID_DATA>{stig.find('title').text}</SID_DATA>
+				</SI_DATA>
+				<SI_DATA>
+					<SID_NAME>uuid</SID_NAME>
+					<SID_DATA></SID_DATA>
+				</SI_DATA>
+				<SI_DATA>
+					<SID_NAME>notice</SID_NAME>
+					<SID_DATA>terms-of-use</SID_DATA>
+				</SI_DATA>
+				<SI_DATA>
+					<SID_NAME>source</SID_NAME>
+					<SID_DATA>{stig.find('reference/source').text}</SID_DATA>
+				</SI_DATA>
+			</STIG_INFO>\n''')
+	# collate rules
+	rules = {}
+	for group in stig.findall('Group'):
+		rules[group.find('Rule/version').text] = [group, None]
+	for result in test_result.findall('rule-result'):
+		x = rules.setdefault(result.attrib['version'], [None, None])
+		x[1] = result.find('result').text
+	# loop over rules
+	for rule_version, (a_stig, result) in rules.items():
+		rule = a_stig.find('Rule')
+		# sort out some rule details
+		desc_text = f"<foo>{rule.find('description').text}</foo>"
+		desc = xml.etree.ElementTree.fromstring(RE_AMP.sub('&amp;', desc_text))
+		details = f'{details_prefix}{result}' if result else ''
+		if result == 'pass':
+			status = 'NotAFinding'
+		elif result is None:
+			status = 'Not_Reviewed'
+		else:
+			status = 'Open'
+		# add as many CCI_REF as there are
+		idents = []
+		for ident in rule.findall('ident'):
+			idents.append(f'''
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>CCI_REF</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(ident)}</ATTRIBUTE_DATA>
+				</STIG_DATA>''')
+		ident_text = ''.join(idents)
+		# add the rule to the docuemnt
+		doc.append(f'''			<VULN>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Vuln_Num</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{a_stig.attrib['id']}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Severity</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{rule.attrib['severity']}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Group_Title</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(a_stig.find('title'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Rule_ID</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{rule.attrib['id']}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Rule_Ver</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{rule_version}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Rule_Title</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(rule.find('title'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Vuln_Discuss</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(desc.find('VulnDiscussion'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>IA_Controls</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(desc.find('IAControls'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Check_Content</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(rule.find('check/check-content'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Fix_Text</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(rule.find('fixtext'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>False_Positives</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(desc.find('FalsePositives'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>False_Negatives</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(desc.find('FalseNegatives'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Documentable</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(desc.find('Documentable'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Mitigations</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(desc.find('Mitigations'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Potential_Impact</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(desc.find('PotentialImpacts'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Third_Party_Tools</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(desc.find('ThirdPartyTools'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Mitigation_Control</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(desc.find('MitigationControl'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Responsibility</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(desc.find('Responsibility'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Security_Override_Guidance</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{to_text(desc.find('SeverityOverrideGuidance'))}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Check_Content_Ref</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{rule.find('check/check-content-ref').attrib['name']}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Weight</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{rule.attrib['weight']}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>Class</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>Unclass</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>STIGRef</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{stigref}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>TargetKey</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA>{id}</ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>STIG_UUID</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA></ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>LEGACY_ID</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA></ATTRIBUTE_DATA>
+				</STIG_DATA>
+				<STIG_DATA>
+					<VULN_ATTRIBUTE>LEGACY_ID</VULN_ATTRIBUTE>
+					<ATTRIBUTE_DATA></ATTRIBUTE_DATA>
+				</STIG_DATA>{ident_text}
+				<STATUS>{status}</STATUS>
+				<FINDING_DETAILS>{details}</FINDING_DETAILS>
+				<COMMENTS></COMMENTS>
+				<SEVERITY_OVERRIDE></SEVERITY_OVERRIDE>
+				<SEVERITY_JUSTIFICATION></SEVERITY_JUSTIFICATION>
+			</VULN>\n''')
+	# finish the document
+	doc.append('\t\t</iSTIG>\n\t</STIGS>\n</CHECKLIST>')
+	text = ''.join(doc)
+	# write output
+	if a.destination in '-':
+		sys.stdout.write(text)
+	else:
+		with open(a.destination, 'w') as file:
+			file.write(text)
+
+
+if __name__ == '__main__':
+	main()
