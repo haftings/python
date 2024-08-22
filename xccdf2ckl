@@ -5,6 +5,7 @@
 import argparse
 import os
 import re
+import uuid
 import sys
 import xml.etree.ElementTree
 
@@ -47,7 +48,7 @@ def main():
 		)
 	)
 	p.add_argument(
-		'--class', default='Unclass', help=(
+		'--class', dest='class_abbreviation', default='Unclass', help=(
 			'classification level abbreviation (default %(default)s), '
 			'usually be set alongside --marking and --classification'
 		)
@@ -77,8 +78,20 @@ def main():
 		help='website or database instance (default \'\')'
 	)
 	p.add_argument(
-		'--uuid', metavar='', default='',
-		help='UUID for this scan (default \'\')'
+		'--uuid', metavar='', default=str(uuid.uuid4()),
+		help='UUID for this scan (random by default)'
+	)
+	p.add_argument(
+		'--spread-uuid', action='store_true',
+		help='assign the UUID to each rule as well as the scan itself'
+	)
+	p.add_argument(
+		'--editor-name', metavar='', default='xccdf2ckl',
+		help='name of CKL generator (default %(default)s)'
+	)
+	p.add_argument(
+		'--editor-version', metavar='', default='0.0',
+		help='name of CKL generator (default %(default)s)'
 	)
 	a = p.parse_args()
 	# read XCCDF XML
@@ -109,7 +122,7 @@ def main():
 	# start writing document
 	doc = []
 	doc.append(f'''<?xml version="1.0" encoding="UTF-8"?>
-<!--xccdf2ckl :: 0.0-->
+<!--{a.editor_name} :: {a.editor_version}-->
 <CHECKLIST>
 	<ASSET>
 		<ROLE>{info.get('role', [None])[0]}</ROLE>
@@ -302,7 +315,7 @@ def main():
 				</STIG_DATA>
 				<STIG_DATA>
 					<VULN_ATTRIBUTE>STIG_UUID</VULN_ATTRIBUTE>
-					<ATTRIBUTE_DATA>{a.uuid}</ATTRIBUTE_DATA>
+					<ATTRIBUTE_DATA>{a.uuid if a.spread_uuid else ''}</ATTRIBUTE_DATA>
 				</STIG_DATA>
 				<STIG_DATA>
 					<VULN_ATTRIBUTE>LEGACY_ID</VULN_ATTRIBUTE>
@@ -319,7 +332,7 @@ def main():
 				<SEVERITY_JUSTIFICATION></SEVERITY_JUSTIFICATION>
 			</VULN>\n''')
 	# finish the document
-	doc.append('\t\t</iSTIG>\n\t</STIGS>\n</CHECKLIST>')
+	doc.append('\t\t</iSTIG>\n\t</STIGS>\n</CHECKLIST>\n')
 	text = ''.join(doc)
 	# write output
 	if a.destination in '-':
