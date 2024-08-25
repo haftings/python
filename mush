@@ -1,0 +1,246 @@
+#! /usr/bin/env python3
+
+'''Run multiple SSH commands at once from a shell-like REPL'''
+
+import argparse
+import atexit
+import os
+import random
+import re
+import readline
+import sys
+import time
+from queue import Queue
+from shlex import split, quote
+from subprocess import run, Popen, CompletedProcess, DEVNULL, PIPE, STDOUT
+from threading import Thread
+
+RE_HOST_SPLIT = re.compile(r'[ \t\n,;]+')
+RE_META_CMD = re.compile(r'^\s*%\s*(.*)')
+
+
+class Result:
+    '''SSH command result'''
+
+    def __init__(self, host: str, id: int, cmd: str, out: str, code: int):
+
+        self.host = host
+        '''Hostname and optional username, e.g. myname@server.com'''
+
+        self.id = id
+        '''Unique identifier for this connection'''
+
+        self.cmd = cmd
+        '''Command line sent to remote shell'''
+
+        self.out = out
+        '''Output from remote shell'''
+
+        self.code = code
+        '''Return code from command line on remote shell'''
+
+    def __repr__(self) -> str:
+        print('wat')
+        text = f'{self.__class__.__name__}({self.host!r}, {self.id!r}, '
+        return text + f'{self.cmd!r}, {self.out!r}, {self.code!r})'
+
+
+class SSH:
+    '''Remote SSH connection'''
+
+    def __init__(self, host: str, id: int, output: Queue[Result] = None):
+        
+        self.host = host
+        '''Hostname and optional username, e.g. myname@server.com'''
+
+        self.id = id
+        '''Unique identifier for this connection'''
+
+        self.output = Queue() if output is None else output
+        '''Queue to which command output is sent'''
+
+        # connect to host
+        self.uuid = f'{random.randrange(2**128):032x}'
+        '''ID used to detect command endings'''
+
+        self.proc = Popen(
+            ['ssh', self.host, '/bin/bash'],
+            stdin=PIPE, stdout=PIPE, stderr=STDOUT,
+            text=True, errors='replace', bufsize=1
+        )
+        '''ssh subprocess'''
+
+    def run(self, cmd: str) -> Result:
+        '''Run a command and return its output (blocking)'''
+        self.proc.stdin.write(f'{cmd}; echo {self.uuid} $?\n')
+        self.proc.stdin.flush()
+        output = []
+        while True:
+            line = self.proc.stdout.readline()
+            if line.startswith(self.uuid):
+                return Result(
+                    self.host, self.id, cmd,
+                    ''.join(output), int(line.split()[1])
+                )
+            output.append(line)
+
+    def close(self, timeout: float = 1.0) -> int:
+        '''Close the SSH connection, return exit code'''
+        self.proc.terminate()
+        t = time.time() + timeout
+        while self.proc.poll() is None and time.time() < t:
+            time.sleep(min(0.1, timeout / 10))
+        if self.proc.poll() is None:
+            self.proc.kill()
+        self.proc.wait()
+        return self.proc.returncode
+
+
+def run_ssh(host: str, cmd: str, q: Queue[CompletedProcess]):
+    '''Run bash script putting returncode and output in queue'''
+    t = Thread(target=_run_ssh, args=(host, cmd, q), daemon=True)
+    t.start()
+
+
+def _run_ssh(host: str, cmd: str, q: Queue[tuple[str, CompletedProcess]]):
+    '''helper'''
+    q.put((host, run(
+        ['ssh', host, '--', cmd],
+        stdout=PIPE, stderr=STDOUT, stdin=DEVNULL,
+        text=True, errors='replace', bufsize=1
+    )))
+
+
+def list_executables(prefix: str = '') -> list[str]:
+    '''List executables in path'''
+    results = set()
+    for dir in os.get_exec_path():
+        try:
+            files = os.listdir(dir)
+        except OSError:
+            files = []
+        for file in files:
+            if not prefix or file.startswith(prefix):
+                try:
+                    if os.stat(os.path.join(dir, file)).st_mode & 0o111:
+                        results.add(file)
+                except OSError:
+                    pass
+    results = sorted(results)
+    return [results[0] + ' '] if len(results) == 1 else results
+
+
+def list_path(prefix: str = '') -> list[str]:
+    '''List paths starting with prefix'''
+    dir, isdir, prefix = prefix.rpartition('/')
+    dir += isdir
+    try:
+        return sorted(
+            os.path.join(dir, file)
+            for file in os.listdir(dir) if file.startswith(prefix)
+        )
+    except OSError:
+        return []
+
+
+def list_hosts(prefix: str = '') -> list[str]:
+    '''List hosts in the ~/.ssh/config'''
+    prefix = prefix[1:]
+    hosts = {'localhost'} if 'localhost'.startswith(prefix) else set()
+    try:
+        with open(os.path.expanduser('~/.ssh/config')) as file:
+            for line in file:
+                if (line.split(None, 1) or '.')[0].lower() == 'host':
+                    for host in line.partition('#')[0].split()[1:]:
+                        if host.startswith(prefix) and '*' not in host:
+                            hosts.add(host)
+    except OSError:
+        pass
+    return sorted(hosts)
+
+
+_completion__list = []
+def completion(text: str, state: int):
+    '''Run readline completion'''
+    with open('readline.log', 'a') as file: file.write(f'{text = } {state = }\n')
+    if state:
+        if state < len(_completion__list):
+            return _completion__list[state]
+        return None
+    _completion__list.clear()
+    if not text:
+        _completion__list.extend(list_executables())
+    elif text.lstrip()[:1] in ('-', '+'):
+        _completion__list.extend(list_hosts(text))
+    elif text in '..' or '/' in text:
+        _completion__list.extend(list_path(text))
+    else:
+        _completion__list.extend(list_executables(text))
+    with open('readline.log', 'a') as file: file.write(f'{_completion__list = }\n')
+    return _completion__list[0]
+
+
+def setup_readline():
+    '''Set up the readline module (call this only once!)'''
+    if os.path.isfile(path := os.path.expanduser('~/.inputrc')):
+        readline.read_init_file(path)
+    if os.path.isfile(path := os.path.expanduser('~/.mush_history')):
+        readline.read_history_file(path)
+    atexit.register(readline.write_history_file, path)
+    readline.set_completer(completion)
+    readline.set_completer_delims('')
+    readline.parse_and_bind('tab: complete')
+
+
+def main():
+    '''run script'''
+    # parse arguments
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('host', nargs='+', help='hosts to connect to')
+    a = p.parse_args()
+    # setup
+    setup_readline()
+    # repl loop
+    q: Queue[tuple[str, CompletedProcess]] = Queue()
+    while True:
+        cmd = input('⫸ ')
+        # meta commands
+        if r := RE_META_CMD.match(cmd):
+            # add or remove host(s)
+            if r[1][:1] in ('+', '-'):
+                adding = r[1][0] == '+'
+                for host in split(cmd[1:]):
+                    if host.startswith(('+', '-')):
+                        adding = host[0] == '+'
+                        if not (host := host[1:]):
+                            continue
+                    if adding:
+                        a.host.append(host)
+                    else:
+                        a.host = [i for i in a.host if i != host]
+                continue
+            else:
+                sys.stderr.write(f'unrecognized meta command: {quote(r[1])}\n')
+                continue
+        for host in a.host:
+            run_ssh(host, cmd, q)
+        for _ in a.host:
+            host, proc = q.get()
+            if proc.returncode:
+                sys.stdout.write(
+                    f'\n\033[31;1m⪡ {host}\033[22m ({proc.returncode})\033[39m'
+                    f'\n\033[2m{proc.stdout}\033[22m\n'
+                )
+            else:
+                sys.stdout.write(
+                    f'\n\033[34;1m⪡ {host}\033[22m ({proc.returncode})\033[39m'
+                    f'\n\033[2m{proc.stdout}\033[22m\n'
+                )
+        if cmd == 'exit':
+            sys.exit()
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (EOFError, KeyboardInterrupt):
+        sys.stderr.write('\n')
