@@ -180,15 +180,17 @@ def main():
             # show response (error)
             if proc.returncode:
                 sys.stdout.write(
-                    f'\n\033[31;1m⪡ {host}\033[22m ({proc.returncode})\033[39m'
-                    f'\n\033[2m{proc.stdout}\033[22m\n'
+                    f'\033[31;1m⪡ {host}\033[22m ({proc.returncode})\033[39m'
+                    f'\n\033[2m{proc.stdout}\033[22m'
                 )
             # show response (success)
             else:
                 sys.stdout.write(
-                    f'\n\033[34;1m⪡ {host}\033[22m ({proc.returncode})\033[39m'
-                    f'\n\033[2m{proc.stdout}\033[22m\n'
+                    f'\033[34;1m⪡ {host}\033[22m ({proc.returncode})\033[39m'
+                    f'\n\033[2m{proc.stdout}\033[22m'
                 )
+            sys.stdout.flush()
+        sys.stdout.write('\n')
 
 if __name__ == '__main__':
     try:
