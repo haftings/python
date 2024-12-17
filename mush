@@ -5,95 +5,18 @@
 import argparse
 import atexit
 import os
-import random
 import re
 import readline
 import sys
-import time
 from queue import Queue
 from shlex import split, quote
-from subprocess import run, Popen, CompletedProcess, DEVNULL, PIPE, STDOUT
+from subprocess import run, CompletedProcess, DEVNULL, PIPE, STDOUT
 from threading import Thread
 
 RE_HOST_SPLIT = re.compile(r'[ \t\n,;]+')
 RE_META_CMD = re.compile(r'^\s*%\s*(.*)')
 RE_IGNORE_PREFIX = re.compile(r'^\s*(?:\$\s+)?', re.M)
 RE_EXIT = re.compile(r'^\s*exit\s*(?:#.*)?$')
-
-class Result:
-    '''SSH command result'''
-
-    def __init__(self, host: str, id: int, cmd: str, out: str, code: int):
-
-        self.host = host
-        '''Hostname and optional username, e.g. myname@server.com'''
-
-        self.id = id
-        '''Unique identifier for this connection'''
-
-        self.cmd = cmd
-        '''Command line sent to remote shell'''
-
-        self.out = out
-        '''Output from remote shell'''
-
-        self.code = code
-        '''Return code from command line on remote shell'''
-
-    def __repr__(self) -> str:
-        text = f'{self.__class__.__name__}({self.host!r}, {self.id!r}, '
-        return text + f'{self.cmd!r}, {self.out!r}, {self.code!r})'
-
-
-class SSH:
-    '''Remote SSH connection'''
-
-    def __init__(self, host: str, id: int, output: Queue[Result] = None):
-        
-        self.host = host
-        '''Hostname and optional username, e.g. myname@server.com'''
-
-        self.id = id
-        '''Unique identifier for this connection'''
-
-        self.output = Queue() if output is None else output
-        '''Queue to which command output is sent'''
-
-        # connect to host
-        self.uuid = f'{random.randrange(2**128):032x}'
-        '''ID used to detect command endings'''
-
-        self.proc = Popen(
-            ['ssh', self.host, '/bin/bash'],
-            stdin=PIPE, stdout=PIPE, stderr=STDOUT,
-            text=True, errors='replace', bufsize=1
-        )
-        '''ssh subprocess'''
-
-    def run(self, cmd: str) -> Result:
-        '''Run a command and return its output (blocking)'''
-        self.proc.stdin.write(f'{cmd}; echo {self.uuid} $?\n')
-        self.proc.stdin.flush()
-        output = []
-        while True:
-            line = self.proc.stdout.readline()
-            if line.startswith(self.uuid):
-                return Result(
-                    self.host, self.id, cmd,
-                    ''.join(output), int(line.split()[1])
-                )
-            output.append(line)
-
-    def close(self, timeout: float = 1.0) -> int:
-        '''Close the SSH connection, return exit code'''
-        self.proc.terminate()
-        t = time.time() + timeout
-        while self.proc.poll() is None and time.time() < t:
-            time.sleep(min(0.1, timeout / 10))
-        if self.proc.poll() is None:
-            self.proc.kill()
-        self.proc.wait()
-        return self.proc.returncode
 
 
 def run_ssh(host: str, cmd: str, q: Queue[CompletedProcess]):
