@@ -5,6 +5,7 @@
 import argparse
 import atexit
 import os
+import random
 import re
 import readline
 import sys
@@ -21,13 +22,17 @@ RE_EXIT = re.compile(r'^\s*exit\s*(?:#.*)?$')
 
 def run_ssh(host: str, cmd: str, q: Queue[CompletedProcess]):
     '''Run bash script putting returncode and output in queue'''
-    t = Thread(target=_run_ssh, args=(host, cmd, q), daemon=True)
+    id = random.randrange(2 ** 128)
+    t = Thread(target=_run_ssh, args=(id, host, cmd, q), daemon=True)
     t.start()
+    return id
 
 
-def _run_ssh(host: str, cmd: str, q: Queue[tuple[str, CompletedProcess]]):
+def _run_ssh(
+    id: int, host: str, cmd: str, q: Queue[tuple[int, str, CompletedProcess]]
+):
     '''helper'''
-    q.put((host, run(
+    q.put((id, host, run(
         ['ssh', host, '--', cmd],
         stdout=PIPE, stderr=STDOUT, stdin=DEVNULL,
         text=True, errors='replace', bufsize=1
@@ -124,7 +129,7 @@ def main():
     # setup
     setup_readline()
     # repl loop
-    q: Queue[tuple[str, CompletedProcess]] = Queue()
+    q: Queue[tuple[int, str, CompletedProcess]] = Queue()
     while True:
         cmd = input('⫸ ')
         # meta commands
@@ -151,24 +156,27 @@ def main():
         # regular command
         cmd = RE_IGNORE_PREFIX.sub('', cmd)
         # send command to all hosts
+        hosts = {}
         for host in a.host:
-            run_ssh(host, cmd, q)
+            hosts[run_ssh(host, cmd, q)] = host
         # retrieve results from all hosts
-        remaining_hosts = list(a.host)
-        msg = ''
+        got_responses = {id: False for id in hosts}
         for _ in a.host:
             # show remaining hosts
-            msg = ', '.join(sorted(remaining_hosts))
+            msg = ', '.join(
+                hosts[id]
+                for id, got_response in got_responses.items()
+                if not got_response
+            )
             msg = f'\n\033[33m… {msg}\033[39m'
             sys.stderr.write(msg)
             sys.stderr.flush()
             # receive response from next host
-            host, proc = q.get()
-            remaining_hosts.remove(host)
+            id, host, proc = q.get()
+            got_responses[id] = True
             # clear remaining hosts message
-            if msg:
-                sys.stderr.write('\010' * len(msg) + '\033[J')
-                sys.stderr.flush()
+            sys.stderr.write('\010' * len(msg) + '\033[J')
+            sys.stderr.flush()
             # show response (error)
             if proc.returncode:
                 sys.stdout.write(
