@@ -231,13 +231,28 @@ def main():
         for host in a.host:
             run_ssh(host, cmd, q)
         # retrieve results from all hosts
+        remaining_hosts = list(a.host)
+        msg = ''
         for _ in a.host:
+            # show remaining hosts
+            msg = ', '.join(sorted(remaining_hosts))
+            msg = f'\n\033[33m… {msg}\033[39m'
+            sys.stderr.write(msg)
+            sys.stderr.flush()
+            # receive response from next host
             host, proc = q.get()
+            remaining_hosts.remove(host)
+            # clear remaining hosts message
+            if msg:
+                sys.stderr.write('\010' * len(msg) + '\033[J')
+                sys.stderr.flush()
+            # show response (error)
             if proc.returncode:
                 sys.stdout.write(
                     f'\n\033[31;1m⪡ {host}\033[22m ({proc.returncode})\033[39m'
                     f'\n\033[2m{proc.stdout}\033[22m\n'
                 )
+            # show response (success)
             else:
                 sys.stdout.write(
                     f'\n\033[34;1m⪡ {host}\033[22m ({proc.returncode})\033[39m'
