@@ -120,11 +120,27 @@ def setup_readline():
     readline.parse_and_bind('tab: complete')
 
 
+def format(host: str, code: int, text: str) -> str:
+    '''Format response text for output'''
+    if code:
+        msg = f'\033[31;1m⪡ {host}\033[22m ({code})\033[39m'
+        return msg + f'\n\033[2m{text}\033[22m'
+    msg = f'\033[34;1m⪡ {host}\033[22m ({code})\033[39m'
+    return msg + f'\n\033[2m{text}\033[22m'
+
+
 def main():
     '''run script'''
     # parse arguments
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('host', nargs='+', help='hosts to connect to')
+    p.add_argument(
+        'host', nargs='+',
+        help='host(s) to connect to'
+    )
+    p.add_argument(
+        '-m', '--merge', action='store_true',
+        help='merge together identical output'
+    )
     a = p.parse_args()
     # setup
     setup_readline()
@@ -161,15 +177,15 @@ def main():
             hosts[run_ssh(host, cmd, q)] = host
         # retrieve results from all hosts
         got_responses = {id: False for id in hosts}
+        responses = {}
         for _ in a.host:
             # show remaining hosts
-            msg = ', '.join(
-                hosts[id]
-                for id, got_response in got_responses.items()
-                if not got_response
+            msg = '… ' + ', '.join(
+                hosts[id] for id, got_it in got_responses.items() if not got_it
             )
-            msg = f'\n\033[33m… {msg}\033[39m'
-            sys.stderr.write(msg)
+            if not a.merge:
+                sys.stderr.write('\n')
+            sys.stderr.write(f'\033[33m{msg}\033[39m')
             sys.stderr.flush()
             # receive response from next host
             id, host, proc = q.get()
@@ -177,20 +193,19 @@ def main():
             # clear remaining hosts message
             sys.stderr.write('\010' * len(msg) + '\033[J')
             sys.stderr.flush()
+            # store response
+            if a.merge:
+                content = proc.returncode, proc.stdout
+                responses.setdefault(content, []).append(host)
+                continue
             # show response (error)
-            if proc.returncode:
-                sys.stdout.write(
-                    f'\033[31;1m⪡ {host}\033[22m ({proc.returncode})\033[39m'
-                    f'\n\033[2m{proc.stdout}\033[22m'
-                )
-            # show response (success)
-            else:
-                sys.stdout.write(
-                    f'\033[34;1m⪡ {host}\033[22m ({proc.returncode})\033[39m'
-                    f'\n\033[2m{proc.stdout}\033[22m'
-                )
+            sys.stdout.write(format(host, proc.returncode, proc.stdout))
             sys.stdout.flush()
         sys.stdout.write('\n')
+        # show merged responses
+        if a.merge:
+            for (code, text), hosts in responses.items():
+                sys.stdout.write(format(', '.join(hosts), code, text) + '\n')
 
 if __name__ == '__main__':
     try:
