@@ -90,7 +90,8 @@ def list_hosts(prefix: str = '') -> list[str]:
 _completion__list = []
 def completion(text: str, state: int):
     '''Run readline completion'''
-    with open('readline.log', 'a') as file: file.write(f'{text = } {state = }\n')
+    with open('readline.log', 'a') as file:
+        file.write(f'{text = } {state = }\n')
     if state:
         if state < len(_completion__list):
             return _completion__list[state]
@@ -104,7 +105,8 @@ def completion(text: str, state: int):
         _completion__list.extend(list_path(text))
     else:
         _completion__list.extend(list_executables(text))
-    with open('readline.log', 'a') as file: file.write(f'{_completion__list = }\n')
+    with open('readline.log', 'a') as file:
+        file.write(f'{_completion__list = }\n')
     return _completion__list[0]
 
 
@@ -178,9 +180,9 @@ def main():
         # retrieve results from all hosts
         got_responses = {id: False for id in hosts}
         responses = {}
-        for _ in a.host:
+        for i in range(len(a.host), 0, -1):
             # show remaining hosts
-            msg = '… ' + ', '.join(
+            msg = f'waiting for {i} / {len(a.host)}: ' + ', '.join(
                 hosts[id] for id, got_it in got_responses.items() if not got_it
             )
             if not a.merge:
