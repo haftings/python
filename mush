@@ -14,13 +14,16 @@ from shlex import split, quote
 from subprocess import run, CompletedProcess, DEVNULL, PIPE, STDOUT
 from threading import Thread
 
+# TODO: Ctrl+C should cancel SSH session(s) if running, instead of whole REPL
+# TODO: `-n` option to limit concurrent session count
+
 RE_HOST_SPLIT = re.compile(r'[ \t\n,;]+')
 RE_META_CMD = re.compile(r'^\s*%\s*(.*)')
 RE_IGNORE_PREFIX = re.compile(r'^\s*(?:\$\s+)?', re.M)
 RE_EXIT = re.compile(r'^\s*exit\s*(?:#.*)?$')
 
 
-def run_ssh(host: str, cmd: str, q: Queue[CompletedProcess]):
+def run_ssh(host: str, cmd: str, q: Queue[tuple[int, str, CompletedProcess]]):
     '''Run bash script putting returncode and output in queue'''
     id = random.randrange(2 ** 128)
     t = Thread(target=_run_ssh, args=(id, host, cmd, q), daemon=True)
