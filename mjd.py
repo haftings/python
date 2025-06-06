@@ -97,7 +97,7 @@ class Info(_NamedTuple):
     '''Julian Datetime (JD)'''
 
 
-def info(value: float | int | _datetime | Info | tuple) -> Info:
+def info(value: str | float | int | _datetime | Info | _Iterable) -> Info:
     '''Get calendar `Info` about a date and time'''
     t = datetime(value)
     m = mjd(value)
@@ -111,9 +111,15 @@ def info(value: float | int | _datetime | Info | tuple) -> Info:
     )
 
 
-def datetime(value: float | int | _datetime | Info | tuple) -> _datetime:
+def datetime(
+    value: str | float | int | _datetime | Info | _Iterable
+) -> _datetime:
     '''Convert various types to a UTC `datetime`, input `value` can be:
 
+    - `str` with an ISO format datetime
+      - alternative characters for "-", "T", and ":" allowed
+      - en-us 3-char month names are allowed
+      - week/day-of-week are not allowed
     - `float` or `int` for an MJD or JD
     - `tuple` with one of the formats:
       - `(yyyy, doy)`
@@ -137,11 +143,8 @@ def datetime(value: float | int | _datetime | Info | tuple) -> _datetime:
     if isinstance(value, Info):
         return value.dt
     if isinstance(value, _Iterable):
-        try:
-            n = len(value)
-        except TypeError:
-            value = tuple(value)
-            n = len(value)
+        value = tuple(value)
+        n = len(value)
         if n == 2:
             yyyy, doy = value
             return _datetime(yyyy, 1, 1, tzinfo=_UTC) + _timedelta(doy - 1)
@@ -160,10 +163,14 @@ def datetime(value: float | int | _datetime | Info | tuple) -> _datetime:
     raise TypeError(f'unsupported date & time type: {type(value)}')
 
 
-def mjd(value: float | int | _datetime | Info | tuple) -> float:
+def mjd(value: str | float | int | _datetime | Info | _Iterable) -> float:
     '''Convert various types to a Modified Julian Date (MJD),
     input `value` can be:
 
+    - `str` with an ISO format datetime
+      - alternative characters for "-", "T", and ":" allowed
+      - en-us 3-char month names are allowed
+      - week/day-of-week are not allowed
     - `float` or `int` for an MJD or JD
     - `tuple` with one of the formats:
       - `(yyyy, doy)`
@@ -189,11 +196,8 @@ def mjd(value: float | int | _datetime | Info | tuple) -> float:
     if isinstance(value, Info):
         return value.mjd
     if isinstance(value, _Iterable):
-        try:
-            n = len(value)
-        except TypeError:
-            value = tuple(value)
-            n = len(value)
+        value = tuple(value)
+        n = len(value)
         if n == 2:
             yyyy, doy = value
             value = _datetime(yyyy, 1, 1, tzinfo=_UTC) + _timedelta(doy - 1)
