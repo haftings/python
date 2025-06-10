@@ -11,7 +11,7 @@ from datetime import timezone as _timezone, UTC as _UTC
 from typing import Iterable as _Iterable, NamedTuple as _NamedTuple
 
 MJD_EPOCH = _datetime(1858, 11, 17, tzinfo=_UTC)
-_A_DAY = _timedelta(1)
+_ONE_DAY = _timedelta(1)
 _MON2MO = {
     'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
     'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
@@ -97,22 +97,32 @@ class Info(_NamedTuple):
     '''Julian Datetime (JD)'''
 
 
-def info(value: str | float | int | _datetime | Info | _Iterable) -> Info:
+def info(
+    value: str | float | int | _datetime | Info | _Iterable | None = None
+) -> Info:
     '''Get calendar `Info` about a date and time'''
     t = datetime(value)
-    m = mjd(value)
+    m = mjd(t if value is None else value)
     cal = t.isocalendar()
     return Info(
         yyyy=t.year, mm=t.month, dd=t.day, HH=t.hour, MM=t.minute,
         SS=((t.second * 1000000 + t.microsecond) / 1000000),
-        doy=((t - _datetime(t.year, 1, 1, tzinfo=_UTC) + _A_DAY) / _A_DAY),
+        doy=((t - _datetime(t.year, 1, 1, tzinfo=_UTC) + _ONE_DAY) / _ONE_DAY),
         woy=cal.week, dow=(cal.weekday - 1) % 7, yy=(t.year % 100),
         dt=t, mjd=m, jd=(m + 2400000.5)
     )
 
 
+def doy(
+    value: str | float | int | _datetime | Info | _Iterable | None = None
+) -> float:
+    '''Get day of year for a date and time'''
+    t = datetime(value)
+    return (t - _datetime(t.year, 1, 1, tzinfo=_UTC) + _ONE_DAY) / _ONE_DAY
+
+
 def datetime(
-    value: str | float | int | _datetime | Info | _Iterable
+    value: str | float | int | _datetime | Info | _Iterable | None = None
 ) -> _datetime:
     '''Convert various types to a UTC `datetime`, input `value` can be:
 
@@ -128,6 +138,8 @@ def datetime(
       - `(yyyy, mo, dd, hh, mm, ss)`
     - `datetime` assumed to be UTC if timezone isn't explicitly set
     '''
+    if value is None:
+        return _datetime.now(_UTC)
     if isinstance(value, _datetime):
         if value.tzinfo:
             return value if value.tzinfo == _UTC else value.astimezone(_UTC)
@@ -163,7 +175,9 @@ def datetime(
     raise TypeError(f'unsupported date & time type: {type(value)}')
 
 
-def mjd(value: str | float | int | _datetime | Info | _Iterable) -> float:
+def mjd(
+    value: str | float | int | _datetime | Info | _Iterable | None = None
+) -> float:
     '''Convert various types to a Modified Julian Date (MJD),
     input `value` can be:
 
@@ -179,12 +193,14 @@ def mjd(value: str | float | int | _datetime | Info | _Iterable) -> float:
       - `(yyyy, mo, dd, hh, mm, ss)`
     - `datetime` assumed to be UTC if timezone isn't explicitly set
     '''
+    if value is None:
+        return (_datetime.now(_UTC) - MJD_EPOCH) / _ONE_DAY
     if isinstance(value, _datetime):
         try:
-            return (value - MJD_EPOCH) / _A_DAY
+            return (value - MJD_EPOCH) / _ONE_DAY
         except TypeError:
             value = value.replace(tzinfo=_UTC)
-            return (value - MJD_EPOCH) / _A_DAY
+            return (value - MJD_EPOCH) / _ONE_DAY
     if isinstance(value, (int, float)):
         if value >= 2973119:
             return value - 2400000.5
@@ -214,7 +230,7 @@ def mjd(value: str | float | int | _datetime | Info | _Iterable) -> float:
             value = t + _timedelta(seconds=ss)
         else:
             raise TypeError(f'unsupported date & time tuple length: {n}')
-        return (value - MJD_EPOCH) / _A_DAY
+        return (value - MJD_EPOCH) / _ONE_DAY
     raise TypeError(f'unsupported date & time type: {type(value)}')
 
 
@@ -285,7 +301,7 @@ def text2mjd(text: str) -> float:
         dt = _datetime(
             int(yyyy), mo, int(dd or 1), int(hh or 0), int(mm or 0), tzinfo=tz
         ) + _timedelta(int(doy or 1) - 1, float(ss or 0))
-        return (dt - MJD_EPOCH) / _A_DAY
+        return (dt - MJD_EPOCH) / _ONE_DAY
     # give a friendlier error for bad input
     except OSError:
         raise ValueError(f'invalid datetime value: {text}')
@@ -303,14 +319,14 @@ def main():
         n = -1
     # current datetime
     if n == 0 or n == 1 and _sys.argv[1] in '-':
-        print(f' {mjd(_datetime.now(tz=_UTC)):0.6f}')
+        print(f' {mjd(_datetime.now(_UTC)):0.6f}')
     elif n == 1:
         # mjd or jd -> calendar
         if _re.match(r'^\s*(?:\.\d+|\d+\.?\d*)\s*$', _sys.argv[1]):
             print(f' {datetime(_sys.argv[1]):%Y %m %d %H %M %S}')
         # calendar -> mjd or jd
         else:
-            print(f' {mjd(_datetime.now(tz=_UTC)):0.6f}')
+            print(f' {mjd(_datetime.now(_UTC)):0.6f}')
     # calendar -> mjd or jd
     elif n in (2, 3, 5, 6):
         print(f' {mjd(map(int, _sys.argv[1:])):0.6f}')
