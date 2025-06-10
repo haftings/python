@@ -2,6 +2,7 @@
 
 '''Convert to/from Modified Julian Dates (MJDs) and other datetime formats'''
 
+import argparse as _argparse
 import os as _os
 import re as _re
 import shlex as _shlex
@@ -306,59 +307,107 @@ def text2mjd(text: str) -> float:
     except OSError:
         raise ValueError(f'invalid datetime value: {text}')
 
-
+_help_text = (
+    '\narguments:\n'
+    '    -                 current MJD (default with no other options)\n'
+    '    iso               ISO datetime (week/day-of-week not supported)\n'
+    '    yyyy              4-digit year (0-9999) or 2-digit year (1900-1999)\n'
+    '    mm                month of year\n'
+    '    dd                day of month\n'
+    '    doy               day of year (a decimal value is allowed)\n'
+    '    HH                hour of day (24-hour clock)\n'
+    '    MM                minute of hour\n'
+    '    SS                second of minute (a decimal value is allowed)\n'
+    '    mjd               Modified Julian Day (MJD) - converted to calendar\n'
+    '    jd                Julian Day (JD) - converted to calendar\n'
+    '\noptions:\n'
+    '    -m, --mjd         show the modified Julian date (MJD) (default)\n'
+    '    -j, --jd          show the Julian date (JD)\n'
+    '    -d, --doy         show the day of year (DOY)\n'
+    '    -c, --calendar    show the ISO calendar format\n'
+    '    -i, --integer     truncate to day (show MJD/JD as integers)\n'
+    '    -f, --fractional  include time (show MJD/JD with decimal)\n'
+    '    -h, --help        show this help message and exit\n'
+)
 def main():
     '''run as script'''
-    # non-POSIX syntax means `argparse` won't work well U_U
     # get command name
     cmd = _sys.argv[0] or 'mjd'
     cmd = _shlex.quote(_os.path.basename(cmd) if cmd.startswith('/') else cmd)
-    n = len(_sys.argv) - 1
-    # check for -h, --help
-    if any(map(_re.compile(r'^--help$|^-(?!-).*h').match, _sys.argv)):
-        n = -1
-    # current datetime
-    if n == 0 or n == 1 and _sys.argv[1] in '-':
-        print(f' {mjd(_datetime.now(_UTC)):0.6f}')
-    elif n == 1:
-        # mjd or jd -> calendar
-        if _re.match(r'^\s*(?:\.\d+|\d+\.?\d*)\s*$', _sys.argv[1]):
-            print(f' {datetime(_sys.argv[1]):%Y %m %d %H %M %S}')
-        # calendar -> mjd or jd
+    # set up argument parser (non-POSIX args make these parameters annoying)
+    p = _argparse.ArgumentParser(add_help=False, usage=(
+        f'\n    {cmd} [-ifmjdc] [-]                    # current mjd'
+        f'\n    {cmd} [-ifmjdc] iso                    # ISO datetime'
+        f'\n    {cmd} [-ifmjdc] yyyy mm dd [HH MM SS]  # calendar datetime'
+        f'\n    {cmd} [-ifmjdc] yyyy doy [HH MM SS]    # calendar datetime'
+        f'\n    {cmd} [-ifmjdc] mjd                    # modified Julian date'
+        f'\n    {cmd} [-ifmjdc] jd                     # Julian date'
+    ))
+    p.add_argument(
+        'args', nargs='*'
+    )
+    p.add_argument(
+        '-m', '--mjd', action='store_const', const='mjd', dest='fmt',
+        default='mjd'
+    )
+    p.add_argument(
+        '-j', '--jd', action='store_const', const='jd', dest='fmt'
+    )
+    p.add_argument(
+        '-d', '--doy', action='store_const', const='doy', dest='fmt'
+    )
+    p.add_argument(
+        '-c', '--calendar', action='store_const', const='calendar', dest='fmt'
+    )
+    p.add_argument(
+        '-i', '--integer', action='store_true'
+    )
+    p.add_argument(
+        '-f', '--fractional', action='store_false', dest='integer'
+    )
+    p.add_argument(
+        '-h', '--help', action='store_true'
+    )
+    a = p.parse_args()
+    if a.help:
+        # write help message
+        _sys.stdout.write(f'{__doc__}\n\n')
+        p.print_usage()
+        _sys.stdout.write(_help_text)
+        _sys.exit()
+    n = len(a.args)
+    try:
+        # current datetime
+        if n == 0 or n == 1 and a.args[0] == '-':
+            t = _datetime.now(_UTC)
+        # mjd or jd
+        elif n == 1:
+            t = datetime(a.args[0])
+        # calendar
+        elif n in (2, 3, 5, 6):
+            t = mjd(map(int, _sys.argv[1:]))
+        # wat?
         else:
-            print(f' {mjd(_datetime.now(_UTC)):0.6f}')
-    # calendar -> mjd or jd
-    elif n in (2, 3, 5, 6):
-        print(f' {mjd(map(int, _sys.argv[1:])):0.6f}')
-    # help message
-    else:
-        if n != -1:
-            print(f'error: invalid input\n')
-        print(
-            f'{cmd} - Convert to/from Modified Julian Date (MJD)\n'
-            '\nUsage:\n'
-            f'    {cmd} [-]\n'
-            f'    {cmd} iso\n'
-            f'    {cmd} year month day [hour minute second]\n'
-            f'    {cmd} year doy [hour minute second]\n'
-            f'    {cmd} mjd\n'
-            f'    {cmd} jd\n'
-            '\nArguments:\n'
-            '    -       current MJD (default with no other options)\n'
-            '    iso     ISO datetime (week/day-of-week format not supported)\n'
-            '    year    4-digit or 2-digit year, 2-digit years are 1900-1999\n'
-            '    month   month of year\n'
-            '    day     day of month\n'
-            '    hour    hour of day (24-hour clock)\n'
-            '    minute  minute of hour\n'
-            '    second  second of minute (a decimal value is allowed)\n'
-            '    doy     day of year (a decimal value is allowed)\n'
-            '    mjd     Modified Julian Day (MJD) - converted to calendar\n'
-            '    jd      Julian Day (JD) - converted to calendar'
-        )
-        if n != -1:
-            _sys.exit(1)
-
+            p.error('incorrect argument count')
+    except ValueError:
+        p.error(f'invalid input date')
+    except OverflowError:
+        p.error(f'invalid input date (out of max range)')
+    try:
+        # output
+        if a.fmt in 'mjd':
+            v = mjd(t) + 2400000.5 if a.fmt == 'jd' else mjd(t)
+            _sys.stdout.write(f'{int(v)}\n' if a.integer else f'{v:0.6f}\n')
+        elif a.fmt == 'calendar':
+            if a.integer:
+                _sys.stdout.write(f'{t:%Y-%m-%d}\n')
+            else:
+                _sys.stdout.write(f'{t:%Y-%m-%dT%H:%M:%S.%f}\n')
+        else:
+            v = doy(t)
+            _sys.stdout.write(f'{int(v)}\n' if a.integer else f'{v:0.6f}\n')
+    except ValueError:
+        p.error(f'could not convert to {a.fmt}')
 
 if __name__ == '__main__':
     main()
