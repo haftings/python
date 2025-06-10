@@ -385,7 +385,7 @@ def main():
             t = datetime(a.args[0])
         # calendar
         elif n in (2, 3, 5, 6):
-            t = mjd(map(int, _sys.argv[1:]))
+            t = datetime(map(int, a.args))
         # wat?
         else:
             p.error('incorrect argument count')
