@@ -11,8 +11,7 @@ from random import choices
 from subprocess import DEVNULL, PIPE, STDOUT
 from subprocess import Popen as _Popen, run as _run
 from subprocess import CompletedProcess, CalledProcessError
-from tempfile import TemporaryDirectory as _TemporaryDirectory
-from typing import NamedTuple as _NamedTuple, Literal
+from typing import NamedTuple, Literal, IO
 from collections.abc import Callable, Generator, Iterable
 import sys
 import weakref
@@ -62,7 +61,7 @@ _MULTIPLEX_OPTS: dict[str, str] = {
 def noop(*args, **kwargs) -> None:
     '''"no operation" function that does nothing'''
 
-class RsyncEvent(_NamedTuple):
+class RsyncEvent(NamedTuple):
     '''an event from a running rsync command'''
     event: str
     name: str | None = None
@@ -196,25 +195,32 @@ class SSH:
 
     def run(
         self, cmd: Iterable[str] | str, *,
-        shell: bool = False, cwd: str = '', **kwargs
+        check: bool = False,
+        text: bool | None = None,
+        encoding: str | None = None,
+        errors: str | None = None,
+        stdin: int | IO | None = None,
+        stdout: int | IO | None = None,
+        stderr: int | IO | None = None,
+        input: str | bytes | None = None,
+        capture_output: bool = False,
+        bufsize: int = -1,
+        pipesize: int = -1,
+        cwd: str | None = None,
+        shell: bool = False
     ) -> CompletedProcess:
         '''run a command on the remote host, similar to `subprocess.run`
 
-        - most arguments work the same as for `subprocess.run`
-        - `cwd` will change the remote directory before execution
+        - `cwd` changes the remote directory before execution
+        - other arguments work the same as for `subprocess.run`
         '''
-        # reproduce eccentric way that subprocess handles cmd and shell
-        if shell:
-            if not isinstance(cmd, str):
-                cmd = next(iter(cmd))
-        else:
-            cmd = _quote(cmd) if isinstance(cmd, str) else _join(cmd)
-        # add cd for cwd
-        if cwd:
-            cmd = f'cd {_quote(cwd)} || exit $?; ' + cmd
-        # run the command
-        opts = ssh_opt_args(_MULTIPLEX_OPTS | self.opts)
-        return _run(['ssh', self._host, *opts, '--', cmd], **kwargs)
+        return run(
+            self._host, cmd, shell=shell, cwd=cwd,
+            check=check, text=text, encoding=encoding, errors=errors,
+            stdin=stdin, stdout=stdout, stderr=stderr,
+            input=input, capture_output=capture_output,
+            bufsize=bufsize, pipesize=pipesize, **(_MULTIPLEX_OPTS | self.opts)
+        )
 
     def Popen(
         self, cmd: Iterable[str] | str, *,
@@ -512,6 +518,49 @@ def _join(tokens: Iterable[str]) -> str:
     return ' '.join(map(_quote, tokens))
 
 
+def run(
+    host: str, cmd: Iterable[str] | str, *,
+    check: bool = False,
+    text: bool | None = None,
+    encoding: str | None = None,
+    errors: str | None = None,
+    stdin: int | IO | None = None,
+    stdout: int | IO | None = None,
+    stderr: int | IO | None = None,
+    input: str | bytes | None = None,
+    capture_output: bool = False,
+    bufsize: int = -1,
+    pipesize: int = -1,
+    cwd: str | None = None,
+    shell: bool = False,
+    **opts
+) -> CompletedProcess:
+    '''run a command on the remote host, similar to `subprocess.run`
+
+    - `host` is the hostname and optionally username, e.g. `user@host`
+    - `opts` keywords set `ssh_config` options (case-insensitive)
+    - `cwd` changes the remote directory before execution
+    - other arguments work the same as for `subprocess.run`
+    '''
+    # reproduce eccentric way that subprocess handles cmd and shell
+    if shell:
+        if not isinstance(cmd, str):
+            cmd = next(iter(cmd))
+    else:
+        cmd = _quote(cmd) if isinstance(cmd, str) else _join(cmd)
+    # add cd for cwd
+    if cwd:
+        cmd = f'cd {_quote(cwd)} || exit $?; ' + cmd
+    # run the command
+    return _run(
+        ['ssh', host, *ssh_opt_args(opts), '--', cmd],
+        check=check, text=text, encoding=encoding, errors=errors,
+        stdin=stdin, stdout=stdout, stderr=stderr,
+        input=input, capture_output=capture_output,
+        bufsize=bufsize, pipesize=pipesize
+    )
+
+
 def rsync(
     source_path: str | Iterable[str],
     dest_path: str = '.',
@@ -597,7 +646,7 @@ def open(
         return TextFile(proc, proc.stdin)
 
 
-def _close_ssh_file(proc: _Popen, file: BufferedIOBase | TextIOWrapper):
+def _close_ssh_file(proc: _Popen, file: IO):
     '''close an ssh file and wait on the parent process'''
     file.close()
     if returncode := proc.wait():
