@@ -148,10 +148,15 @@ class SSH:
     ```
     '''
     def __init__(self, host: str, **opts: str) -> None:
-        self.host = str(host) or 'localhost'
+        self._host = str(host) or 'localhost'
         self.opts: dict[str, str | int | float | bool] = dict(opts)
         self._proc: _Popen | None = None
         self._entries: int = 0
+
+    @property
+    def host(self) -> str:
+        '''hostname and optionally username, e.g. "user@host"'''
+        return self._host
 
     def __enter__(self):
         if not self._entries:
@@ -171,7 +176,7 @@ class SSH:
             remote_cmd = 'echo; while :; do echo >&2; sleep 1; done'
             # start the ssh process
             opts = ssh_opt_args(_MULTIPLEX_OPTS | self.opts)
-            cmd = ['ssh', self.host, *opts, remote_cmd]
+            cmd = ['ssh', self._host, *opts, remote_cmd]
             self._proc = _Popen(
                 cmd, stderr=DEVNULL, stdout=PIPE, stdin=DEVNULL
             )
@@ -209,7 +214,7 @@ class SSH:
             cmd = f'cd {_quote(cwd)} || exit $?; ' + cmd
         # run the command
         opts = ssh_opt_args(_MULTIPLEX_OPTS | self.opts)
-        return _run(['ssh', self.host, *opts, '--', cmd], **kwargs)
+        return _run(['ssh', self._host, *opts, '--', cmd], **kwargs)
 
     def Popen(
         self, cmd: Iterable[str] | str, *,
@@ -231,7 +236,7 @@ class SSH:
             cmd = f'cd {_quote(cwd)} || exit $?; ' + cmd
         # start the command
         opts = ssh_opt_args(_MULTIPLEX_OPTS | self.opts)
-        full_cmd = ['ssh', self.host, *opts, '--', cmd]
+        full_cmd = ['ssh', self._host, *opts, '--', cmd]
         return _Popen(full_cmd, **kwargs)
 
     def upload(
@@ -241,7 +246,7 @@ class SSH:
     ):
         '''same as `rsync()`, but `rem_path` knows to uses this connection'''
         rsync(
-            local_path, f'{self.host}:{rem_path}', arg, *args,
+            local_path, f'{self._host}:{rem_path}', arg, *args,
             callback=callback, verbose=verbose, **(_MULTIPLEX_OPTS | self.opts)
         )
 
@@ -253,7 +258,7 @@ class SSH:
         '''same as `rsync()`, but `rem_path` knows to uses this connection'''
         paths = [rem_path] if isinstance(rem_path, str) else rem_path
         rsync(
-            [f'{self.host}:{path}' for path in paths], local_path, arg, *args,
+            [f'{self._host}:{path}' for path in paths], local_path, arg, *args,
             callback=callback, verbose=verbose, **(_MULTIPLEX_OPTS | self.opts)
         )
 
