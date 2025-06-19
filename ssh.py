@@ -128,19 +128,19 @@ class SSH:
     '''Class to handle SSH connection(s) to a host
 
     `SSH(...)`
-    - `host`: hostname and optional username, e.g. `someuser@somehost`
-    - `opts`: `ssh_config` options, which are case-insensitive, e.g. `port=22`
+    - `host` is the hostname and optional username, e.g. `user@host`
+    - `opts` keywords set `ssh_config` options, e.g. `port=22`
 
     SSH sessions/connections are formed either once for each SSH operation:
     ```python
-    ssh_host = SSH('someuser@somehost')  # no connection/session yet
+    ssh_host = SSH('user@host')  # no connection/session yet
     ssh_host.run(['echo', 'hello'])      # one full ssh session during run #1
     ssh_hsot.run(['echo', 'goodbye'])    # second full ssh session during run #2
     ```
 
     Or you can form a connection and reuse it using `with`:
     ```python
-    with SSH('someuser@somehost') as ssh_host:  # session started
+    with SSH('user@host') as ssh_host:  # session started
         ssh_host.run(['echo', 'hello'])         # uses existing session
         ssh_host.run(['echo', 'goodbye'])       # uses existing session again
     # session closes at the end of the `with` block
@@ -224,90 +224,46 @@ class SSH:
 
     def Popen(
         self, cmd: Iterable[str] | str, *,
-        shell: bool = False, cwd: str = '', **kwargs
+        text: bool | None = None,
+        encoding: str | None = None,
+        errors: str | None = None,
+        stdin: int | IO | None = None,
+        stdout: int | IO | None = None,
+        stderr: int | IO | None = None,
+        bufsize: int = -1,
+        pipesize: int = -1,
+        cwd: str | None = None,
+        shell: bool = False,
+        **opts
     ) -> _Popen:
         '''start a command on the remote host, similar to `subprocess.Popen`
 
-        - most arguments work the same as for `subprocess.Popen`
-        - `cwd` will change the remote directory before execution
+        - `cwd` changes the remote directory before execution
+        - other arguments work the same as for `subprocess.Popen`
         '''
-        # reproduce eccentric way that subprocess handles cmd and shell
-        if shell:
-            if not isinstance(cmd, str):
-                cmd = next(iter(cmd))
-        else:
-            cmd = _quote(cmd) if isinstance(cmd, str) else _join(cmd)
-        # add cd for cwd
-        if cwd:
-            cmd = f'cd {_quote(cwd)} || exit $?; ' + cmd
-        # start the command
-        opts = ssh_opt_args(_MULTIPLEX_OPTS | self.opts)
-        full_cmd = ['ssh', self._host, *opts, '--', cmd]
-        return _Popen(full_cmd, **kwargs)
-
-    def upload(
-        self, local_path: str | Iterable[str], rem_path: str = '.',
-        arg: str = '-ac', *args: str,
-        verbose: bool = False, callback: Callable[[RsyncEvent], None] = noop
-    ):
-        '''same as `rsync()`, but `rem_path` knows to uses this connection'''
-        rsync(
-            local_path, f'{self._host}:{rem_path}', arg, *args,
-            callback=callback, verbose=verbose, **(_MULTIPLEX_OPTS | self.opts)
+        return Popen(
+            self._host, cmd, shell=shell, cwd=cwd,
+            text=text, encoding=encoding, errors=errors,
+            stdin=stdin, stdout=stdout, stderr=stderr,
+            bufsize=bufsize, pipesize=pipesize, **(_MULTIPLEX_OPTS | self.opts)
         )
-
-    def download(
-        self, rem_path: str | Iterable[str], local_path: str = '.',
-        arg: str = '-ac', *args: str,
-        verbose: bool = False, callback: Callable[[RsyncEvent], None] = noop
-    ):
-        '''same as `rsync()`, but `rem_path` knows to uses this connection'''
-        paths = [rem_path] if isinstance(rem_path, str) else rem_path
-        rsync(
-            [f'{self._host}:{path}' for path in paths], local_path, arg, *args,
-            callback=callback, verbose=verbose, **(_MULTIPLEX_OPTS | self.opts)
-        )
-
-    def write(
-        self, rem_path: str, content: bytes | str, *,
-        append: bool = False, perms: int | None = None
-    ):
-        '''write content to a remote file
-
-        - `append` appends to the file instead of overwriting
-        - `perms` also sets the permissions of the resulting file
-        '''
-        rpath = _quote(rem_path)
-        redir = '>>' if append else '>'
-        perms_cmd = f' && chmod {perms:03o} {rpath}' if perms else ''
-        rcmd = f'cat {redir} {rpath}{perms_cmd}'
-        cmd = ['bash', '-c', rcmd]
-        with self.Popen(cmd, stdin=PIPE) as proc:
-            if isinstance(content, str):
-                content = content.encode()
-            if not proc.stdin:
-                raise OSError(1, 'ssh missing stdin')
-            proc.stdin.write(content)
-        if proc.returncode:
-            raise CalledProcessError(proc.returncode, cmd)
-
-    def read(
-        self, rem_path: str, mode: Literal['b', 't'] = 't',
-        encoding='utf-8', errors='replace'
-    ) -> str | bytes:
-        '''read text from a remote file
-        
-        - `mode` is `'t'` for text (the default) or `'b'` for bytes
-        '''
-        data = self.run(['cat', '--', rem_path], stdout=PIPE, check=True).stdout
-        binary = 'b' in (mode or '').lower()
-        return data if binary else data.decode(encoding, errors)
 
     def open(
-        self, rem_path: str, mode: str = 'r',
-        encoding='utf-8', errors='replace'
-    ) -> BufferedIOBase | TextIOWrapper:
-        ...
+        self, path: str, mode: MODE_STR = 'r', *,
+        encoding: str = 'UTF-8', errors='replace',
+        verbose: bool = False, **opts: str | int | float | bool,
+    ) -> TextIOWrapper | BufferedIOBase:
+        '''open a file-like object for a remote file over SSH
+
+        - any valid combination of read, write, append, text, and binary is allowed
+        - seeking and `+` modes are not allowed
+        - `opts` keywords set `ssh_config` options, e.g. `port=22`
+        - `verbose` sends and remote STDERR error output to the python STDOUT
+        '''
+        return open(
+            self._host, path, mode, encoding=encoding, errors=errors,
+            verbose=verbose, **(_MULTIPLEX_OPTS | self.opts)
+        )
 
 class SSHShell:
     '''SSH connection to a host, may be used as a context manager
@@ -319,7 +275,7 @@ class SSHShell:
       - `False` turn multiplexing totally off
       - an `int` number keeps the SSH multiplex running in the background
         for that many seconds after closing the most recent connection
-    - additional keyword `opts` set `ssh_config` options with `-o` flags
+    - `opts` keywords set `ssh_config` options, e.g. `port=22`
 
     You may safely run a single command like this:
     ```
@@ -538,7 +494,7 @@ def run(
     '''run a command on the remote host, similar to `subprocess.run`
 
     - `host` is the hostname and optionally username, e.g. `user@host`
-    - `opts` keywords set `ssh_config` options (case-insensitive)
+    - `opts` keywords set `ssh_config` options, e.g. `port=22`
     - `cwd` changes the remote directory before execution
     - other arguments work the same as for `subprocess.run`
     '''
@@ -561,6 +517,45 @@ def run(
     )
 
 
+def Popen(
+    host: str, cmd: Iterable[str] | str, *,
+    text: bool | None = None,
+    encoding: str | None = None,
+    errors: str | None = None,
+    stdin: int | IO | None = None,
+    stdout: int | IO | None = None,
+    stderr: int | IO | None = None,
+    bufsize: int = -1,
+    pipesize: int = -1,
+    cwd: str | None = None,
+    shell: bool = False,
+    **opts
+) -> _Popen:
+    '''start a command on the remote host, similar to `subprocess.Popen`
+
+    - `host` is the hostname and optionally username, e.g. `user@host`
+    - `opts` keywords set `ssh_config` options, e.g. `port=22`
+    - `cwd` changes the remote directory before execution
+    - other arguments work the same as for `subprocess.Popen`
+    '''
+    # reproduce eccentric way that subprocess handles cmd and shell
+    if shell:
+        if not isinstance(cmd, str):
+            cmd = next(iter(cmd))
+    else:
+        cmd = _quote(cmd) if isinstance(cmd, str) else _join(cmd)
+    # add cd for cwd
+    if cwd:
+        cmd = f'cd {_quote(cwd)} || exit $?; ' + cmd
+    # run the command
+    return _Popen(
+        ['ssh', host, *ssh_opt_args(opts), '--', cmd],
+        text=text, encoding=encoding, errors=errors,
+        stdin=stdin, stdout=stdout, stderr=stderr,
+        bufsize=bufsize, pipesize=pipesize
+    )
+
+
 def rsync(
     source_path: str | Iterable[str],
     dest_path: str = '.',
@@ -575,7 +570,7 @@ def rsync(
       - `--rsh`, `--verbose`, `--quiet`, and `--progress` may be ignored
     - `verbose` prints the `rsync` command and shows `rsync`'s STDERR
     - `callback` is called once for each update output from `rsync`
-    - `opts` are `ssh_config` options to set with `--rsh`
+    - `opts` keywords set `ssh_config` options, e.g. `port=22`
     - raises a `CalledProcessError` if `rsync` fails
     '''
     src = [source_path] if isinstance(source_path, str) else list(source_path)
@@ -605,10 +600,22 @@ def ssh_opt_args(opts: dict[str, str | int | float | bool] = {}) -> list[str]:
 
 
 def open(
-    host: str, path: str, mode: MODE_STR = 'r', *, verbose: bool = False,
-    encoding: str = 'UTF-8', errors='replace', **opts: str | int | float | bool,
-    
+    host: str,
+    path: str,
+    mode: MODE_STR = 'r',
+    *,
+    verbose: bool = False,
+    encoding: str = 'UTF-8',
+    errors='replace',
+    **opts: str | int | float | bool
 ) -> TextIOWrapper | BufferedIOBase:
+    '''open a file-like object for a remote file over SSH
+
+    - any valid combination of read, write, append, text, and binary is allowed
+    - seeking and `+` modes are not allowed
+    - `opts` keywords set `ssh_config` options, e.g. `port=22`
+    - `verbose` sends and remote STDERR error output to the python STDOUT
+    '''
     err = None if verbose else DEVNULL
     if mode in {'r', 'rt', 'tr', 'rb', 'br'}:
         cmd = ['ssh', *ssh_opt_args(opts), host, f'cat {_quote(path)}']
@@ -646,7 +653,7 @@ def open(
         return TextFile(proc, proc.stdin)
 
 
-def _close_ssh_file(proc: _Popen, file: IO):
+def _close_ssh_file(proc: _Popen, file: BufferedIOBase | TextIOWrapper):
     '''close an ssh file and wait on the parent process'''
     file.close()
     if returncode := proc.wait():
