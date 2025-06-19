@@ -125,16 +125,6 @@ def rsync_decode(text: bytes) -> str:
     return _RE_RSYNC_ESCAPE.sub(_rsync_decode, text).decode(errors='replace')
 
 
-class RunResult(_NamedTuple):
-    '''Result from an SSH `run()` remote command call'''
-
-    out: bytes
-    '''STDOUT and STDERR'''
-
-    code: int
-    '''return code, or -1 for N/A'''
-
-
 class SSH:
     '''Class to handle SSH connection(s) to a host
 
@@ -403,7 +393,7 @@ class SSHShell:
         if not self._entries:
             self.disconnect()
 
-    def run(self, cmd: Iterable[str] | str) -> RunResult:
+    def run(self, cmd: Iterable[str] | str) -> CompletedProcess[bytes]:
         '''run a remote command
 
         - `Iterable[str]` is the preferred, safer method
@@ -422,7 +412,9 @@ class SSHShell:
                 raise OSError('connection pipe missing')
             # convert str to command
             if isinstance(cmd, str):
-                cmd = 'bash', '-c', cmd
+                cmd = ['bash', '-c', cmd]
+            else:
+                cmd = list(cmd)
             # escape tokens and join into a command line
             cmd_line = ' '.join(map(_quote, cmd)).encode() + b'\0'
             # send command to remote host
@@ -437,35 +429,36 @@ class SSHShell:
                 output += new_output
             # extract return code
             if not (r := _RE_CODE.search(output[(-26 - _ID_LENGTH):])):
-                return RunResult(output, -1)
+                return CompletedProcess(cmd, 0, output)
             # return results
-            return RunResult(output[:(-3 - len(r[1]) - _ID_LENGTH)], int(r[1]))
+            output = output[:(-3 - len(r[1]) - _ID_LENGTH)]
+            return CompletedProcess(cmd, int(r[1]), output)
 
     def pwd(self) -> str:
         '''get the present working directory on the remote host'''
         # refresh cached pwd if needed
         if not self._pwd:
             # ask remote host for pwd
-            pwd_bytes, code = self.run(['pwd'])
-            if code or not pwd_bytes.endswith(b'\n'):
-                raise OSError(code or 1, 'ssh pwd failed')
+            p = self.run(['pwd'])
+            if p.returncode or not p.stdout.endswith(b'\n'):
+                raise OSError(p.returncode or 1, 'ssh pwd failed')
             # convert pwd from bytes to text, stripping the trailing '\n'
-            self._pwd = pwd_bytes[:-1].decode()
+            self._pwd = p.stdout[:-1].decode()
         return self._pwd
 
     def read_b(self, rem_path: str) -> bytes:
         '''read a remote binary file'''
         # conveniently, the cat command does exactly what we want
-        data, code = self.run(['cat', rem_path])
+        p = self.run(['cat', rem_path])
         # raise error if needed
-        if code:
+        if p.returncode:
             # try to parse error from process output
             msg = ''
-            if r := _RE_ERROR.search(data[-1024:]):
+            if r := _RE_ERROR.search(p.stdout[-1024:]):
                 msg = r[1].decode(errors='replace')
             # raise with parsed error if possible, otherwise a generic message
-            raise OSError(code, msg or 'read error')
-        return data
+            raise CalledProcessError(p.returncode, p.args, msg or 'read error')
+        return p.stdout
 
     def read(self, rem_path: str, encoding='utf-8', errors='replace') -> str:
         '''read a remote text file'''
