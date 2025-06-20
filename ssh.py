@@ -128,16 +128,16 @@ class SSH:
 
     SSH sessions/connections are formed either once for each SSH operation:
     ```python
-    ssh_host = SSH('user@host')  # no connection/session yet
-    ssh_host.run(['echo', 'hello'])      # one full ssh session during run #1
-    ssh_hsot.run(['echo', 'goodbye'])    # second full ssh session during run #2
+    ssh_host = SSH('user@host')    # no connection/session yet
+    ssh_host(['echo', 'hello'])    # one full ssh session during run #1
+    ssh_hsot(['echo', 'goodbye'])  # second full ssh session during run #2
     ```
 
     Or you can form a connection and reuse it using `with`:
     ```python
     with SSH('user@host') as ssh_host:  # session started
-        ssh_host.run(['echo', 'hello'])         # uses existing session
-        ssh_host.run(['echo', 'goodbye'])       # uses existing session again
+        ssh_host(['echo', 'hello'])     # uses existing session
+        ssh_host(['echo', 'goodbye'])   # uses existing session again
     # session closes at the end of the `with` block
     ```
     '''
@@ -188,7 +188,7 @@ class SSH:
             self._proc.wait()
             self._proc = None
 
-    def run(
+    def __call__(
         self, cmd: Iterable[str] | str, *,
         check: bool = False,
         text: bool | None = None,
@@ -266,19 +266,25 @@ class PrematureExit(CalledProcessError):
 
 class Shell(MutableMapping):
     '''SSH connection to host emulating the experience of the remote shell
-    
+
+    - Call a shell object like a function to run a command on the remote shell
+    - Use it like a dictionary to access remote environment variables
+
     basic usage:
     ```
-    with Shell('hostname') as shell:        # start the shell
-        shell.source('some_file.sh')        # source a script
-        shell['EXPORTED_ENV_VAR'] = 'foo'   # get/set environment variables
-        shell.run(['echo', 'hello world'])  # run a command
+    with Shell('hostname') as sh:        # start the shell
+        sh('echo hello world')           # run a command
+        if 'FOO_BAR' not in sh:          # check for environment variables
+            sh['FOO_BAR'] = 'baz qux'    # and get/set environment variables
+        remote_environ = dict(sh)        # get the full environment dict
     ```
     '''
     # TODO use `in` or `re.search` instead of `endswith` in case of
     # TODO     stdout/err pollution from a background process
     # TODO make `Shell` a context manager
     # TODO use `weakref` for more robust cleanup
+    # TODO add `Shell(tee=True)` to forward stdout to local stdout (after run)
+    # TODO convert some values to str automatically for Shell[key] = value
 
     def __init__(self, host: str | SSH, text: bool = True):
         # settings
@@ -305,7 +311,7 @@ class Shell(MutableMapping):
                 host, cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT
             )
         # test new connection to ensure that everything is working
-        self.run(':', check=True)
+        self(':', check=True)
 
     def close(self, timeout: int | float = 10):
         '''exit the shell, SIGTERM until `timeout`, then KILL if needed'''
@@ -321,7 +327,7 @@ class Shell(MutableMapping):
     def closed(self) -> bool:
         return not self._proc
 
-    def run(
+    def __call__(
         self, cmd: Iterable[str] | str, check: bool = False, *,
         text: bool | None = None,
         encoding: str = 'UTF-8', errors: str = 'replace'
@@ -396,12 +402,12 @@ class Shell(MutableMapping):
         
     def source(self, path: str, args: Iterable[str] = ()) -> CompletedProcess:
         '''equivalent to `run(['source', path, **args])`'''
-        return self.run(['source', path, *args])
+        return self(['source', path, *args])
 
     def cd(self, path: str = '') -> str:
         '''change remote present working directory, returns the new `pwd`'''
         cmd = f'cd {_quote(path)} && pwd' if path else 'cd && pwd'
-        out: str = self.run(cmd, check=True, text=True).stdout
+        out: str = self(cmd, check=True, text=True).stdout
         if not out.endswith('\n'):
             raise ValueError
         self._pwd = out[:-1]
@@ -414,7 +420,7 @@ class Shell(MutableMapping):
         - setting `pwd` is equivalent to `cd(pwd, expand=False)`
         '''
         if self._pwd is None:
-            out: str = self.run('pwd', check=True, text=True).stdout
+            out: str = self('pwd', check=True, text=True).stdout
             if not out.endswith('\n'):
                 raise ValueError('invalid pwd output')
             self._pwd = out[:-1]
@@ -423,40 +429,36 @@ class Shell(MutableMapping):
     def pwd(self, path: str):
         self.cd(path)
 
-    def _volatile_env(self) -> dict[str, str]:
+    def _get_env(self) -> dict[str, str]:
         '''unsafe env access'''
         if self._env is None:
-            lines = self.run('env -0', check=True, text=True).stdout.split('\0')
+            lines = self('env -0', check=True, text=True).stdout.split('\0')
             tokenized_lines = (line.partition('=') for line in lines if line)
             self._env = {k: v for k, _, v in tokenized_lines}
         return self._env
 
-    def env(self) -> dict[str, str]:
-        '''get environment variables'''
-        return dict(self._volatile_env())
-
     def __len__(self) -> int:
         '''environment variable count'''
-        return len(self._volatile_env())
+        return len(self._get_env())
     def __getitem__(self, key: str) -> str:
         '''get environment variable'''
-        return self._volatile_env()[key]
+        return self._get_env()[key]
     def __iter__(self) -> Iterator[str]:
-        return iter(self._volatile_env())
+        return iter(self._get_env())
     def __contains__(self, key: str) -> bool:
-        return key in self._volatile_env()
+        return key in self._get_env()
     def keys(self) -> Iterable[str]:
-        return self._volatile_env().keys()
+        return self._get_env().keys()
     def items(self) -> Iterable[tuple[str, str]]:
-        return self._volatile_env().items()
+        return self._get_env().items()
     def values(self) -> Iterable[str]:
-        return self._volatile_env().values()
+        return self._get_env().values()
     def get(self, key: str, default: Any = None) -> str | Any:
-        return self._volatile_env().get(key, default)
+        return self._get_env().get(key, default)
     def __eq__(self, other):
-        return self._volatile_env() == other
+        return self._get_env() == other
     def __ne__(self, other):
-        return self._volatile_env() != other
+        return self._get_env() != other
 
     def __setitem__(self, key: str, value: str):
         # ensure valid key and value
@@ -464,7 +466,7 @@ class Shell(MutableMapping):
             raise ValueError(f'invalid environment variable name: {key}')
         value.encode('utf-8')  # just testing before making the leap
         # set on remote shell
-        self.run(['export', f'{key}={value}'], check=True)
+        self(['export', f'{key}={value}'], check=True)
         # set in local cache
         if self._env is not None:
             self._env[key] = value
@@ -474,7 +476,7 @@ class Shell(MutableMapping):
         if not _IS_VALID_ENV_VAR_NAME(key):
             raise ValueError(f'invalid environment variable name: {key}')
         # set on remote shell
-        self.run(f'unset {key}', check=True)
+        self(f'unset {key}', check=True)
         # set in local cache
         if self._env is not None:
             try:
