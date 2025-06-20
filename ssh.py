@@ -2,22 +2,18 @@
 
 '''Manage jobs across multiple processes and hosts'''
 
-import errno
-import os
 import re
 from datetime import timedelta
 from io import BytesIO, BufferedIOBase, TextIOWrapper
 from random import choices
-from subprocess import DEVNULL, PIPE, STDOUT
+from subprocess import DEVNULL, PIPE, STDOUT, TimeoutExpired
 from subprocess import Popen as _Popen, run as _run
 from subprocess import CompletedProcess, CalledProcessError
-from typing import NamedTuple, Literal, IO
-from collections.abc import Callable, Generator, Iterable
+from typing import NamedTuple, Literal, IO, Any
+from collections.abc import Callable, Generator, Iterable, Iterator
+from collections.abc import MutableMapping
 import sys
 import weakref
-
-# TODO Call rsync, open, etc from SSH instead of reproducing
-# TODO do something to unify SSH and SSHShell
 
 MODE_STR = Literal[
     'r', 'rt', 'tr', 'rb', 'br',
@@ -26,8 +22,6 @@ MODE_STR = Literal[
 ]
 _ID_CHARS = b'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz@_'
 _ID_LENGTH = 22
-_RE_CODE = re.compile(rb'\n(\d+) [^\n]+\n$')
-_RE_ERROR = re.compile(rb'([^\n]+)\n?$')
 _RE_RSYNC_ESCAPE = re.compile(rb'\\#([0-7][0-7][0-7])')
 _RE_RSYNC = re.compile(rb'''
     # file_name\n
@@ -57,6 +51,7 @@ _MULTIPLEX_OPTS: dict[str, str] = {
     'controlpath': '~/.ssh/.%u@%h:%p.control',
     'controlpersist': 'no'
 }
+_IS_VALID_ENV_VAR_NAME = re.compile(r'[a-zA-Z_][a-zA-Z0-9_]*$').match
 
 def noop(*args, **kwargs) -> None:
     '''"no operation" function that does nothing'''
@@ -255,7 +250,8 @@ class SSH:
     ) -> TextIOWrapper | BufferedIOBase:
         '''open a file-like object for a remote file over SSH
 
-        - any valid combination of read, write, append, text, and binary is allowed
+        - any valid combination of read, write, append, text,
+          and binary is allowed
         - seeking and `+` modes are not allowed
         - `opts` keywords set `ssh_config` options, e.g. `port=22`
         - `verbose` sends and remote STDERR error output to the python STDOUT
@@ -265,195 +261,226 @@ class SSH:
             verbose=verbose, **(_MULTIPLEX_OPTS | self.opts)
         )
 
-class SSHShell:
-    '''SSH connection to a host, may be used as a context manager
+class PrematureExit(CalledProcessError):
+    '''`CalledProcessError` subclass raised when Shell exits uncleanly'''
 
-    `SSHShell(...)`
-    - `host` = hostname, with optional username, e.g. "someuser@somehost"
-    - `multiplex` = multiplex operations over a single SSH connection
-      - `True` turn multiplexing on only while connection is open (the default)
-      - `False` turn multiplexing totally off
-      - an `int` number keeps the SSH multiplex running in the background
-        for that many seconds after closing the most recent connection
-    - `opts` keywords set `ssh_config` options, e.g. `port=22`
-
-    You may safely run a single command like this:
+class Shell(MutableMapping):
+    '''SSH connection to host emulating the experience of the remote shell
+    
+    basic usage:
     ```
-    SSHShell('someuser@somehost').run(['echo', 'hello world'])
+    with Shell('hostname') as shell:        # start the shell
+        shell.source('some_file.sh')        # source a script
+        shell['EXPORTED_ENV_VAR'] = 'foo'   # get/set environment variables
+        shell.run(['echo', 'hello world'])  # run a command
     ```
-    (The SSH connection will open for `run()` and close before `run()` returns.)
-
-    Or you can safely run several commands in a row like:
-    ```
-    with SSHShell('someuser@somehost') as connection:
-        connection.run(['echo', 'hello'])
-        connection.run(['echo', 'goodbye'])
-    ```
-    (The SSH connection will open at the start of the `with` block,
-    and close when the `with` block ends.)
     '''
+    # TODO use `in` or `re.search` instead of `endswith` in case of
+    # TODO     stdout/err pollution from a background process
+    # TODO make `Shell` a context manager
+    # TODO use `weakref` for more robust cleanup
 
-    def __init__(
-        self, host: str = '', *, multiplex: bool | int = True, **opts: str
-    ):
-        self.host = str(host or '')
-        self.proc: _Popen | None = None
-        self.id = bytes(choices(_ID_CHARS, k=_ID_LENGTH))
-        self.multiplex = multiplex
-        self.opts = dict(opts)
+    def __init__(self, host: str | SSH, text: bool = True):
+        # settings
+        self.text = bool(text)
+        self._host: str | None = None
         self._pwd: str | None = None
-        self._entries: int = 0
+        self._env: dict[str, str] | None = None
+        self._id: bytes = bytes(choices(_ID_CHARS, k=_ID_LENGTH))
+        # make command loop
+        id = self._id.decode('utf-8')
+        cmd = (
+            'while \\read -r -d \'\' CMD; do'  # read null-separated inputs
+            ' eval "$CMD";'                    # run each input command
+            f' printf \'%03d{id}\\n\' "$?";'   # report (returncode, ID, \0)
+            ' done 2>&1'  # redirect stderr remote-side to avoid race condition
+        )
+        # start SSH
+        if isinstance(host, SSH):
+            self._proc = host.Popen(
+                cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT
+            )
+        else:
+            self._proc = Popen(
+                host, cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT
+            )
+        # test new connection to ensure that everything is working
+        self.run(':', check=True)
 
-    def connect(self):
-        '''connect to host'''
-        if not self.proc:
-            # start an ssh process
-            self.proc = _Popen(['ssh', self.host, *self._get_args(), (
-                # remote bash instance runs a do loop
-                b'while :; do'
-                # it reads each command
-                b' read -rd "" cmd;'
-                # exits if asked (without invoking a sub-shell)
-                b' [[ $cmd == exit ]] && exit;'
-                # invokes a sub-shell for each non-exit command
-                b' bash -c -- "$cmd";'
-                # remembers the result
-                b' code=$?;'
-                # sends the return code and the unique ID
-                b' echo; echo $code ' + self.id + b'; '
-                # rinse and repeat
-                b'done'
-            )], stderr=STDOUT, stdout=PIPE, stdin=PIPE)
+    def close(self, timeout: int | float = 10):
+        '''exit the shell, SIGTERM until `timeout`, then KILL if needed'''
+        if self._proc:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout)
+            except TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
 
-    def disconnect(self):
-        '''disconnect from host'''
-        if self.proc:
-            # tell remote bash instance to exit
-            if self.proc.stdin:
-                # there's a chance that the process already closed
-                try:
-                    self.proc.stdin.write(b'exit\n')
-                    self.proc.stdin.flush()
-                    self.proc.stdin.close()
-                # so ignore broken pipe errors
-                except OSError as e:
-                    if e.errno != errno.EPIPE:
-                        raise
-            # wait for the process to die
-            self.proc.wait()
-            # clear current process and working directory references
-            self.proc = self._pwd = None
+    @property
+    def closed(self) -> bool:
+        return not self._proc
 
-    def __enter__(self):
-        # connect if this is the first entry
-        if not self._entries:
-            self.connect()
-        # increment entries
-        self._entries += 1
-        # use SSHShell connection object as itself with context manager
-        return self
-
-    def __exit__(self, exc_type=None, exc_value=None, traceback=None):
-        # decrement entries
-        self._entries = max(0, self._entries - 1)
-        # disconnect if this is the last entry
-        if not self._entries:
-            self.disconnect()
-
-    def run(self, cmd: Iterable[str] | str) -> CompletedProcess[bytes]:
+    def run(
+        self, cmd: Iterable[str] | str, check: bool = False, *,
+        text: bool | None = None,
+        encoding: str = 'UTF-8', errors: str = 'replace'
+    ) -> CompletedProcess:
         '''run a remote command
 
-        - `Iterable[str]` is the preferred, safer method
-        - `str` will run a verbatim `bash` shell command,
-          including any bash-isms and expansions
+        - list of strings is a single command executed verbatim (preferred)
+        - plain string is sent as-is and interpreted by shell (may be unsafe)
+        - `text` defaults to the value from `Shell(..., text=...)`
         '''
-        # connect and disconnect if needed, and assert that it worked
-        with self:
-            assert (
-                self.proc and isinstance(self.proc.stdout, BufferedIOBase)
-            ), 'ssh process must be running piped stdout'
-            # clear cached pwd, in case the command changes it
-            self._pwd = None
-            # need at least STDIN and STDOUT
-            if not (self.proc.stdin and self.proc.stdout):
-                raise OSError('connection pipe missing')
-            # convert str to command
-            if isinstance(cmd, str):
-                cmd = ['bash', '-c', cmd]
+        text = self.text if text is None else text
+        # require process to be initialized
+        if not (
+            self._proc
+            and isinstance(self._proc.stdin, BufferedIOBase)
+            and isinstance(self._proc.stdout, BufferedIOBase)
+        ):
+            raise ValueError('Shell not initialized')
+        # convert command to shell token string
+        if not isinstance(cmd, str):
+            cmd = ' '.join(map(_quote, cmd))
+        # clear cached environment and pwd
+        self._env = self._pwd = None
+        # send the command to remote shell loop
+        self._proc.stdin.write(f'{cmd}\0'.encode('utf-8'))
+        self._proc.stdin.flush()
+        # read output one block at a time
+        min_len = _ID_LENGTH + 4
+        id_ending = self._id + b'\n'
+        data: list[bytes] = []
+        while block := self._proc.stdout.read1():
+            block_len = len(block)
+            # block is long  enough to contain the ending id string
+            if block_len >= min_len:
+                # ending id string found in block
+                if block.endswith(id_ending):
+                    if block_len > min_len:
+                        data.append(block[:-min_len])
+                    output = b''.join(data)
+                    if text:
+                        output = output.decode(encoding, errors)
+                    if (code := int(block[-min_len:(3 - min_len)])) and check:
+                        raise CalledProcessError(code, cmd, output)
+                    return CompletedProcess(cmd, code, output)
+                # ending not found, continue reading
+                else:
+                    data.append(block)
+            # block is too short for an ending, and there's no data to consider
+            elif not data:
+                data.append(block)
+            # block is too short for an ending, but there's data to consider
             else:
-                cmd = list(cmd)
-            # escape tokens and join into a command line
-            cmd_line = ' '.join(map(_quote, cmd)).encode() + b'\0'
-            # send command to remote host
-            self.proc.stdin.write(cmd_line)
-            self.proc.stdin.flush()
-            # read output one block at a time
-            output = b''
-            while not (output.endswith(self.id + b'\n') or self.proc.poll()):
-                # TODO convert this to a list with something clever to add up \
-                # TODO \ and blocks less than 26 + _ID_LENGTH
-                new_output = self.proc.stdout.read1()
-                output += new_output
-            # extract return code
-            if not (r := _RE_CODE.search(output[(-26 - _ID_LENGTH):])):
-                return CompletedProcess(cmd, 0, output)
-            # return results
-            output = output[:(-3 - len(r[1]) - _ID_LENGTH)]
-            return CompletedProcess(cmd, int(r[1]), output)
+                # add cached data to block until it's long enough for an ending
+                while data and len(block) < min_len:
+                    block = data.pop() + block
+                # ending id string found in block now
+                if block.endswith(id_ending):
+                    if block_len > min_len:
+                        data.append(block[:-min_len])
+                    output = b''.join(data)
+                    if text:
+                        output = output.decode(encoding, errors)
+                    return CompletedProcess(cmd, int(block[-min_len:]), output)
+                # block still has no ending id string
+                else:
+                    data.append(block)
+        # never found an ending
+        output = b''.join(data)
+        if text:
+            output = output.decode(encoding, errors)
+        raise PrematureExit(255, cmd, output)
+        
+    def source(self, path: str, args: Iterable[str] = ()) -> CompletedProcess:
+        '''equivalent to `run(['source', path, **args])`'''
+        return self.run(['source', path, *args])
 
-    def pwd(self) -> str:
-        '''get the present working directory on the remote host'''
-        # refresh cached pwd if needed
-        if not self._pwd:
-            # ask remote host for pwd
-            p = self.run(['pwd'])
-            if p.returncode or not p.stdout.endswith(b'\n'):
-                raise OSError(p.returncode or 1, 'ssh pwd failed')
-            # convert pwd from bytes to text, stripping the trailing '\n'
-            self._pwd = p.stdout[:-1].decode()
+    def cd(self, path: str = '') -> str:
+        '''change remote present working directory, returns the new `pwd`'''
+        cmd = f'cd {_quote(path)} && pwd' if path else 'cd && pwd'
+        out: str = self.run(cmd, check=True, text=True).stdout
+        if not out.endswith('\n'):
+            raise ValueError
+        self._pwd = out[:-1]
         return self._pwd
 
-    def read_b(self, rem_path: str) -> bytes:
-        '''read a remote binary file'''
-        # conveniently, the cat command does exactly what we want
-        p = self.run(['cat', rem_path])
-        # raise error if needed
-        if p.returncode:
-            # try to parse error from process output
-            msg = ''
-            if r := _RE_ERROR.search(p.stdout[-1024:]):
-                msg = r[1].decode(errors='replace')
-            # raise with parsed error if possible, otherwise a generic message
-            raise CalledProcessError(p.returncode, p.args, msg or 'read error')
-        return p.stdout
+    @property
+    def pwd(self) -> str:
+        '''remote present working directory
+        
+        - setting `pwd` is equivalent to `cd(pwd, expand=False)`
+        '''
+        if self._pwd is None:
+            out: str = self.run('pwd', check=True, text=True).stdout
+            if not out.endswith('\n'):
+                raise ValueError('invalid pwd output')
+            self._pwd = out[:-1]
+        return self._pwd
+    @pwd.setter
+    def pwd(self, path: str):
+        self.cd(path)
 
-    def read(self, rem_path: str, encoding='utf-8', errors='replace') -> str:
-        '''read a remote text file'''
-        return self.read_b(rem_path).decode(encoding, errors)
+    def _volatile_env(self) -> dict[str, str]:
+        '''unsafe env access'''
+        if self._env is None:
+            lines = self.run('env -0', check=True, text=True).stdout.split('\0')
+            tokenized_lines = (line.partition('=') for line in lines if line)
+            self._env = {k: v for k, _, v in tokenized_lines}
+        return self._env
 
-    def _get_args(self) -> list[str]:
-        '''get the control opts to SSH, and make .ssh dir if missing'''
-        # add SSH control options to enable multiplexing
-        opts = {}
-        if self.multiplex or isinstance(self.multiplex, int):
-            # ensure the user has an ~/.ssh directory
-            ssh_dir = os.path.expanduser('~/.ssh')
-            if not os.path.exists(ssh_dir):
-                os.mkdir(ssh_dir, 0o700)
-            # tell SSH to use ~/.ssh/<socket>
-            opts['controlmaster'] = 'auto'
-            opts['controlpath'] = '~/.ssh/.%u@%h:%p.control'
-            # optionally set persist time
-            if not isinstance(self.multiplex, bool):
-                opts['controlpersist'] = f'{int(self.multiplex)}'
-        opts.update(self.opts)
-        return [f'-o{k} {v}' for k, v in opts.items()]
+    def env(self) -> dict[str, str]:
+        '''get environment variables'''
+        return dict(self._volatile_env())
 
-    def _format_rem_path(self, rem_path: str, quote: bool = True) -> str:
-        '''format a remote path using remote PWD'''
-        if not (rem_path and rem_path.startswith('/')):
-            rem_path = os.path.join(self.pwd(), rem_path)
-        return _quote(rem_path) if quote else rem_path
+    def __len__(self) -> int:
+        '''environment variable count'''
+        return len(self._volatile_env())
+    def __getitem__(self, key: str) -> str:
+        '''get environment variable'''
+        return self._volatile_env()[key]
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._volatile_env())
+    def __contains__(self, key: str) -> bool:
+        return key in self._volatile_env()
+    def keys(self) -> Iterable[str]:
+        return self._volatile_env().keys()
+    def items(self) -> Iterable[tuple[str, str]]:
+        return self._volatile_env().items()
+    def values(self) -> Iterable[str]:
+        return self._volatile_env().values()
+    def get(self, key: str, default: Any = None) -> str | Any:
+        return self._volatile_env().get(key, default)
+    def __eq__(self, other):
+        return self._volatile_env() == other
+    def __ne__(self, other):
+        return self._volatile_env() != other
+
+    def __setitem__(self, key: str, value: str):
+        # ensure valid key and value
+        if not _IS_VALID_ENV_VAR_NAME(key):
+            raise ValueError(f'invalid environment variable name: {key}')
+        value.encode('utf-8')  # just testing before making the leap
+        # set on remote shell
+        self.run(['export', f'{key}={value}'], check=True)
+        # set in local cache
+        if self._env is not None:
+            self._env[key] = value
+    
+    def __delitem__(self, key: str):
+        # ensure valid key
+        if not _IS_VALID_ENV_VAR_NAME(key):
+            raise ValueError(f'invalid environment variable name: {key}')
+        # set on remote shell
+        self.run(f'unset {key}', check=True)
+        # set in local cache
+        if self._env is not None:
+            try:
+                del self._env[key]
+            except KeyError:
+                pass
 
 
 def _quote(token: str) -> str:
@@ -722,7 +749,7 @@ class TextFile(TextIOWrapper):
         return self.file.readline(size)
 
     def readlines(self, hint: int = -1) -> list[str]:
-        return self.file.readlines()
+        return self.file.readlines(hint)
 
     def writable(self) -> bool:
         return self.file.writable()
@@ -799,7 +826,7 @@ class BinaryFile(BufferedIOBase):
         return self.file.readline(size)
 
     def readlines(self, hint: int = -1) -> list[bytes]:
-        return self.file.readlines()
+        return self.file.readlines(hint)
 
     def writable(self) -> bool:
         return self.file.writable()
