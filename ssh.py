@@ -279,8 +279,6 @@ class Shell(MutableMapping):
         remote_environ = dict(sh)        # get the full environment dict
     ```
     '''
-    # TODO use `in` or `re.search` instead of `endswith` in case of
-    # TODO     stdout/err pollution from a background process
     # TODO make `Shell` a context manager
     # TODO use `weakref` for more robust cleanup
     # TODO add `Shell(tee=True)` to forward stdout to local stdout (after run)
@@ -296,9 +294,9 @@ class Shell(MutableMapping):
         # make command loop
         id = self._id.decode('utf-8')
         cmd = (
-            'while \\read -r -d \'\' CMD; do'  # read null-separated inputs
-            ' eval "$CMD";'                    # run each input command
-            f' printf \'%03d{id}\\n\' "$?";'   # report (returncode, ID, \0)
+            'while \\read -r -d \'\' CMD; do'    # read null-separated inputs
+            ' eval "$CMD";'                      # run each input command
+            f' printf \'\\n%03d{id}\\n\' "$?";'  # report (returncode, ID)
             ' done 2>&1'  # redirect stderr remote-side to avoid race condition
         )
         # start SSH
@@ -363,13 +361,13 @@ class Shell(MutableMapping):
             # block is long  enough to contain the ending id string
             if block_len >= min_len:
                 # ending id string found in block
-                if block.endswith(id_ending):
-                    if block_len > min_len:
-                        data.append(block[:-min_len])
+                if 0 <= (pos := block.find(id_ending)):
+                    if pos:
+                        data.append(block[:(pos - 4)])
                     output = b''.join(data)
                     if text:
                         output = output.decode(encoding, errors)
-                    if (code := int(block[-min_len:(3 - min_len)])) and check:
+                    if (code := int(block[(pos - 3):pos])) and check:
                         raise CalledProcessError(code, cmd, output)
                     return CompletedProcess(cmd, code, output)
                 # ending not found, continue reading
@@ -384,13 +382,15 @@ class Shell(MutableMapping):
                 while data and len(block) < min_len:
                     block = data.pop() + block
                 # ending id string found in block now
-                if block.endswith(id_ending):
+                if 0 <= (pos := block.find(id_ending)):
                     if block_len > min_len:
-                        data.append(block[:-min_len])
+                        data.append(block[:(pos - 4)])
                     output = b''.join(data)
                     if text:
                         output = output.decode(encoding, errors)
-                    return CompletedProcess(cmd, int(block[-min_len:]), output)
+                    if (code := int(block[(pos - 3):pos])) and check:
+                        raise CalledProcessError(code, cmd, output)
+                    return CompletedProcess(cmd, code, output)
                 # block still has no ending id string
                 else:
                     data.append(block)
