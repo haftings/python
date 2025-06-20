@@ -279,6 +279,10 @@ class Shell(MutableMapping):
         remote_environ = dict(sh)        # get the full environment dict
     ```
     '''
+    # TODO shell.path: list[str] property
+    # TODO shell.ls() -> list[str]
+    # TODO shell() should default to shell(':')
+    # TODO remember excess data between calls to Shell()()
     # TODO make `Shell` a context manager
     # TODO use `weakref` for more robust cleanup
     # TODO add `Shell(tee=True)` to forward stdout to local stdout (after run)
@@ -309,7 +313,10 @@ class Shell(MutableMapping):
                 host, cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT
             )
         # test new connection to ensure that everything is working
-        self(':', check=True)
+        cmd = rf'''trap 'printf "\n%03d{id}\n" "$?"' EXIT'''
+        if (out := self(cmd, check=True).stdout) != '':
+            self.close()
+            raise CalledProcessError(1, cmd, f'unexpected output: {out!r}')
 
     def close(self, timeout: int | float = 10):
         '''exit the shell, SIGTERM until `timeout`, then KILL if needed'''
@@ -320,10 +327,11 @@ class Shell(MutableMapping):
             except TimeoutExpired:
                 self._proc.kill()
                 self._proc.wait()
+            self._proc = None
 
     @property
     def closed(self) -> bool:
-        return not self._proc
+        return not (self._proc and self._proc.poll() is None)
 
     def __call__(
         self, cmd: Iterable[str] | str, check: bool = False, *,
@@ -339,7 +347,7 @@ class Shell(MutableMapping):
         text = self.text if text is None else text
         # require process to be initialized
         if not (
-            self._proc
+            self._proc and self._proc.poll() is None
             and isinstance(self._proc.stdin, BufferedIOBase)
             and isinstance(self._proc.stdout, BufferedIOBase)
         ):
