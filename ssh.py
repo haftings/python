@@ -334,7 +334,7 @@ class Shell(MutableMapping):
         return not (self._proc and self._proc.poll() is None)
 
     def __call__(
-        self, cmd: Iterable[str] | str, check: bool = False, *,
+        self, cmd: Iterable[str] | str = ':', check: bool = False, *,
         text: bool | None = None,
         encoding: str = 'UTF-8', errors: str = 'replace'
     ) -> CompletedProcess:
