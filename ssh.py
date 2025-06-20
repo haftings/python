@@ -281,12 +281,10 @@ class Shell(MutableMapping):
     '''
     # TODO shell.path: list[str] property
     # TODO shell.ls() -> list[str]
-    # TODO shell() should default to shell(':')
     # TODO remember excess data between calls to Shell()()
     # TODO make `Shell` a context manager
     # TODO use `weakref` for more robust cleanup
     # TODO add `Shell(tee=True)` to forward stdout to local stdout (after run)
-    # TODO convert some values to str automatically for Shell[key] = value
 
     def __init__(self, host: str | SSH, text: bool = True):
         # settings
@@ -445,6 +443,37 @@ class Shell(MutableMapping):
             self._env = {k: v for k, _, v in tokenized_lines}
         return self._env
 
+
+    def __setitem__(self, key: str, value: str):
+        # ensure valid key and value
+        if not _IS_VALID_ENV_VAR_NAME(key):
+            raise ValueError(f'invalid environment variable name: {key}')
+        if not isinstance(value, str):
+            if isinstance(value, bytes):
+                value = value.decode('utf-8', 'replace')
+            elif isinstance(value, (int, float)):
+                value = str(value)
+            else:
+                raise ValueError(f'invalid environment value: {value!r}')
+        # set on remote shell
+        self(['export', f'{key}={value}'], check=True)
+        # set in local cache
+        if self._env is not None:
+            self._env[key] = value
+    
+    def __delitem__(self, key: str):
+        # ensure valid key
+        if not _IS_VALID_ENV_VAR_NAME(key):
+            raise ValueError(f'invalid environment variable name: {key}')
+        # set on remote shell
+        self(f'unset {key}', check=True)
+        # set in local cache
+        if self._env is not None:
+            try:
+                del self._env[key]
+            except KeyError:
+                pass
+
     def __len__(self) -> int:
         '''environment variable count'''
         return len(self._get_env())
@@ -467,30 +496,6 @@ class Shell(MutableMapping):
         return self._get_env() == other
     def __ne__(self, other):
         return self._get_env() != other
-
-    def __setitem__(self, key: str, value: str):
-        # ensure valid key and value
-        if not _IS_VALID_ENV_VAR_NAME(key):
-            raise ValueError(f'invalid environment variable name: {key}')
-        value.encode('utf-8')  # just testing before making the leap
-        # set on remote shell
-        self(['export', f'{key}={value}'], check=True)
-        # set in local cache
-        if self._env is not None:
-            self._env[key] = value
-    
-    def __delitem__(self, key: str):
-        # ensure valid key
-        if not _IS_VALID_ENV_VAR_NAME(key):
-            raise ValueError(f'invalid environment variable name: {key}')
-        # set on remote shell
-        self(f'unset {key}', check=True)
-        # set in local cache
-        if self._env is not None:
-            try:
-                del self._env[key]
-            except KeyError:
-                pass
 
 
 def _quote(token: str) -> str:
