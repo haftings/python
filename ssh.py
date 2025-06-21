@@ -4,7 +4,7 @@
 
 import re
 from datetime import timedelta
-from io import BytesIO, BufferedIOBase, TextIOWrapper
+from io import BytesIO, BufferedIOBase, TextIOWrapper, IOBase
 from random import choices
 from subprocess import DEVNULL, PIPE, STDOUT, TimeoutExpired
 from subprocess import Popen as _Popen, run as _run
@@ -55,6 +55,16 @@ _IS_VALID_ENV_VAR_NAME = re.compile(r'[a-zA-Z_][a-zA-Z0-9_]*$').match
 
 def noop(*args, **kwargs) -> None:
     '''"no operation" function that does nothing'''
+
+def _write_flush_stdout(text: str) -> None:
+    '''write text to stdout, flush stdout'''
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+def _write_flush_stdout_b(data: bytes) -> None:
+    '''write data to stdout, flush stdout'''
+    sys.stdout.buffer.write(data)
+    sys.stdout.flush()
 
 class RsyncEvent(NamedTuple):
     '''an event from a running rsync command'''
@@ -261,14 +271,29 @@ class SSH:
             verbose=verbose, **(_MULTIPLEX_OPTS | self.opts)
         )
 
+
 class PrematureExit(CalledProcessError):
     '''`CalledProcessError` subclass raised when Shell exits uncleanly'''
+
 
 class Shell(MutableMapping):
     '''SSH connection to host emulating the experience of the remote shell
 
     - Call a shell object like a function to run a command on the remote shell
     - Use it like a dictionary to access remote environment variables
+
+    starting args:
+    - `host` hostname and optionally username, e.g. `user@host`
+    - `text` set `True` for `str` output, `False` for `bytes` output
+    - `tee` sends remote process output to a local file or function callback
+      *in addition* to the result's `stdout` attribute, which is always filled
+        - set `True` to send to STDOUT (default)
+        - set `False` to send *only* to the result's `stdout` attribute
+        - file-like object to send to that object's `write()` function
+        - function to send to the function as callbacks
+        - Note: input is typically in <= 4 KiB chunks
+    - `capture` includes output data/text in response `stdout`
+        - Note: response `stderr` is not used
 
     basic usage:
     ```
@@ -278,28 +303,60 @@ class Shell(MutableMapping):
             sh['FOO_BAR'] = 'baz qux'    # and get/set environment variables
         remote_environ = dict(sh)        # get the full environment dict
     ```
+
+    caveats:
+    - tested only on modern versions of `sh` (POSIX shell), `bash`, `dash`
+      - intended to work as generally as possible, but your milage may vary
+    - assumes that shell flushes after `printf` newlines, may break otherwise
     '''
-    # TODO Shell shopt wrapper
-    # TODO shell.exists(path) test for file existence
+    # TODO change PrematureExit to another name, if it makes sense
     # TODO make `Shell` a context manager
     # TODO use `weakref` for more robust cleanup
+    # TODO Shell.shell: NamedTuple with shell name, version, details
+    # TODO  Ref: https://www.gnu.org/savannah-checkouts/gnu/autoconf/manual/autoconf-2.72/autoconf.html#Portable-Shell
+    # TODO bash shopt wrapper
+    # TODO shell.exists(path) test for file existence
     # TODO add `Shell(tee=True)` to forward stdout to local stdout (after run)
 
-    def __init__(self, host: str | SSH, text: bool = True):
+    def __init__(
+        self,
+        host: str | SSH,
+        text: bool = True,
+        tee: (
+            bool | IOBase | Callable[[str], Any] | Callable[[bytes], Any]
+        ) = True,
+        capture: bool = True
+    ):
         # settings
+        
         self.text = bool(text)
-        self._host: str | None = None
+        '''set `True` for `str` output, `False` for `bytes` output'''
+
+        self.tee = tee
+        '''send remote process output to a local file or function callback
+
+        - `True` to send to STDOUT (default)
+        - `False` / `None` (any falsey value) don't send anywhere
+        - file-like object to send to that object's `write()` function
+        - function to send to the function as callbacks
+        - Note: input is typically in <= 4 KiB chunks
+        '''
+
+        self.capture = capture
+        '''include output data/text in response `stdout`'''
+
+        self._host: str | SSH = host
         self._data: bytes = b''
         self._pwd: str | None = None
         self._env: dict[str, str] | None = None
         self._id: bytes = bytes(choices(_ID_CHARS, k=_ID_LENGTH))
-        self._re_msg = re.compile(b'\n([0-9][0-9][0-9])' + self._id + b'\n')
+        self._re_msg = re.compile(b'([0-9][0-9][0-9])' + self._id + b'\n')
         # make command loop
         id = self._id.decode('utf-8')
         cmd = (
-            'while \\read -r -d \'\' CMD; do'    # read null-separated inputs
+            'while \\read -r -d \'\' CMD; do'      # read null-separated inputs
             ' \\eval "$CMD";'                      # run each input command
-            f' \\printf \'\\n%03d{id}\\n\' "$?";'  # report (returncode, ID)
+            f' \\printf \'%03d{id}\\n\' "$?";'  # report (returncode, ID)
             ' done 2>&1'  # redirect stderr remote-side to avoid race condition
         )
         # start SSH
@@ -312,7 +369,7 @@ class Shell(MutableMapping):
                 host, cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT
             )
         # test new connection to ensure that everything is working
-        cmd = rf'''trap 'printf "\n%03d{id}\n" "$?"' EXIT'''
+        cmd = rf'''trap 'printf "%03d{id}\n" "$?"' EXIT'''
         if (out := self(cmd, check=True).stdout) != '':
             self.close()
             raise CalledProcessError(1, cmd, f'unexpected output: {out!r}')
@@ -336,17 +393,37 @@ class Shell(MutableMapping):
         return not (self._proc and self._proc.poll() is None)
 
     def __call__(
-        self, cmd: Iterable[str] | str = ':', check: bool = False, *,
+        self,
+        cmd: Iterable[str] | str = ':',
+        check: bool = False,
+        *,
         text: bool | None = None,
-        encoding: str = 'UTF-8', errors: str = 'replace'
+        encoding: str = 'UTF-8',
+        errors: str = 'replace',
+        tee: (
+            None | bool | IOBase | Callable[[str], Any] | Callable[[bytes], Any]
+        ) = None,
+        capture: bool = True
     ) -> CompletedProcess:
         '''run a remote command
 
-        - list of strings is a single command executed verbatim (preferred)
-        - plain string is sent as-is and interpreted by shell (may be unsafe)
+        - `cmd` is the command to run on the shell
+            - `[str, ...]` is a single command executed verbatim
+            - a single `str` is sent as-is and interpreted by the shell
+        - `check` raises a `CalledProcessError` for a non-zero returncode
         - `text` defaults to the value from `Shell(..., text=...)`
+        - `tee` defaults to the value from `Shell(..., tee=...)`
+        - `capture` saves process output to the result's `stdout` attribute
         '''
+        # note: a core assumption is that the full return code and ID string
+        #       is always sent in a single read1 block, this *should* be true
+        #       for shells because they buffer on lines and code+ID << 4 KiB
         text = self.text if text is None else text
+        if tee := (self.tee if tee is None else tee):
+            if tee_func := getattr(tee, 'write', None):
+                tee = tee_func
+            elif not isinstance(tee, Callable):
+                tee = _write_flush_stdout if text else _write_flush_stdout_b
         # require process to be initialized
         if not (
             self._proc and self._proc.poll() is None
@@ -364,44 +441,30 @@ class Shell(MutableMapping):
         self._proc.stdin.flush()
         # initialize variables for loop
         find_msg = self._re_msg.search
-        msg_len = _ID_LENGTH + 5
-        stored_data: list[bytes] = []
-        old_data: bytes = b''
-        new_data: bytes = self._data or b''
-        self._data = b''
+        storage = [] if capture else None
+        if self._data:
+            _handle_output(self._data, text, tee, storage, encoding, errors)
+            self._data = b''
         # reading loop
-        while True:
-            # combine the last two blocks to search for the next set of data
-            data = old_data + new_data if old_data else new_data
+        while data := self._proc.stdout.read1():
             # search for the trigger msg
-            if r := find_msg(data, max(0, len(old_data) - msg_len)):
+            if r := find_msg(data):
                 # parse returncode
                 code = int(r[1])
                 # remember any extra data after trigger msg
                 self._data = data[r.end():]
                 # store data before trigger msg with the rest of the data
-                stored_data.append(data[:r.start()])
-                # join and decode output
-                output = b''.join(stored_data)
-                if text:
-                    output = output.decode(encoding, errors)
+                data = data[:r.start()]
+                _handle_output(data, text, tee, storage, encoding, errors)
                 # return result
+                output = _join_output(capture, text, storage)
                 if code and check:
                     raise CalledProcessError(code, cmd, output)
                 return CompletedProcess(cmd, code, output)
-            # bump old_data into the storage list
-            if old_data:
-                stored_data.append(old_data)
-            old_data = new_data
-            # read the next new_data block
-            if not (new_data := self._proc.stdout.read1()):
-                # EOF before trigger msg
-                if old_data:
-                    stored_data.append(old_data)
-                output = b''.join(stored_data)
-                if text:
-                    output = output.decode(encoding, errors)
-                raise PrematureExit(255, cmd, output)
+            # bump data into storage
+            _handle_output(data, text, tee, storage, encoding, errors)
+        # EOF before trigger msg
+        raise PrematureExit(255, cmd, _join_output(capture, text, storage))
 
     def source(self, path: str, args: Iterable[str] = ()) -> CompletedProcess:
         '''equivalent to `run(['source', path, **args])`'''
@@ -517,6 +580,19 @@ class Shell(MutableMapping):
     def __ne__(self, other):
         return self._get_env() != other
 
+def _handle_output(data, text, tee, storage, encoding, errors):
+    '''selectively decode, write, and store data'''
+    if tee or storage is not None:
+        if text:
+            data = data.decode(encoding, errors)
+        if storage is not None:
+            storage.append(data)
+        if tee:
+            tee(data)
+
+def _join_output(capture, text, storage):
+    '''selectively join output together'''
+    return ('' if text else b'').join(storage) if capture else None
 
 def _quote(token: str) -> str:
     '''quote a token for safe shell use, including newlines'''
