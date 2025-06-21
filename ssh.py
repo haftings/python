@@ -279,6 +279,7 @@ class Shell(MutableMapping):
         remote_environ = dict(sh)        # get the full environment dict
     ```
     '''
+    # TODO Shell shopt wrapper
     # TODO shell.ls() -> list[str]
     # TODO make `Shell` a context manager
     # TODO use `weakref` for more robust cleanup
@@ -380,10 +381,13 @@ class Shell(MutableMapping):
                 self._data = data[r.end():]
                 # store data before trigger msg with the rest of the data
                 stored_data.append(data[:r.start()])
-                # return the results
+                # join and decode output
                 output = b''.join(stored_data)
                 if text:
                     output = output.decode(encoding, errors)
+                # return result
+                if code and check:
+                    raise CalledProcessError(code, cmd, output)
                 return CompletedProcess(cmd, code, output)
             # bump old_data into the storage list
             if old_data:
