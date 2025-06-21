@@ -167,7 +167,7 @@ class SSH:
         if not self._proc:
             # cmd needs to make frequent, small, flushed outputs indefinitely,
             # and needs to work in all major shells (bash, sh, ksh, zsh)
-            remote_cmd = 'echo; while :; do echo >&2; sleep 1; done'
+            remote_cmd = '\\echo; while \\:; do \\echo >&2; \\sleep 1; done'
             # start the ssh process
             opts = ssh_opt_args(_MULTIPLEX_OPTS | self.opts)
             cmd = ['ssh', self._host, *opts, remote_cmd]
@@ -280,7 +280,7 @@ class Shell(MutableMapping):
     ```
     '''
     # TODO Shell shopt wrapper
-    # TODO shell.ls() -> list[str]
+    # TODO shell.exists(path) test for file existence
     # TODO make `Shell` a context manager
     # TODO use `weakref` for more robust cleanup
     # TODO add `Shell(tee=True)` to forward stdout to local stdout (after run)
@@ -298,8 +298,8 @@ class Shell(MutableMapping):
         id = self._id.decode('utf-8')
         cmd = (
             'while \\read -r -d \'\' CMD; do'    # read null-separated inputs
-            ' eval "$CMD";'                      # run each input command
-            f' printf \'\\n%03d{id}\\n\' "$?";'  # report (returncode, ID)
+            ' \\eval "$CMD";'                      # run each input command
+            f' \\printf \'\\n%03d{id}\\n\' "$?";'  # report (returncode, ID)
             ' done 2>&1'  # redirect stderr remote-side to avoid race condition
         )
         # start SSH
@@ -407,9 +407,21 @@ class Shell(MutableMapping):
         '''equivalent to `run(['source', path, **args])`'''
         return self(['source', path, *args])
 
+    def ls(self, dir: str = '') -> tuple[str, ...]:
+        '''list remote directory'''
+        if dir and dir not in '.':
+            cmd = f'(\\cd {_quote(dir)} && \\find . -maxdepth 1 -print0)'
+        else:
+            cmd = '\\find . -maxdepth 1 -print0'
+        output = self(cmd, check=True, text=True).stdout
+        return tuple(sorted({
+            name[2:] if name[:2] == './' else name
+            for name in output.split('\0') if name not in '..'
+        }))
+
     def cd(self, path: str = '') -> str:
         '''change remote present working directory, returns the new `pwd`'''
-        cmd = f'cd {_quote(path)} && pwd' if path else 'cd && pwd'
+        cmd = f'\\cd {_quote(path)} && \\pwd' if path else '\\cd && \\pwd'
         out: str = self(cmd, check=True, text=True).stdout
         if not out.endswith('\n'):
             raise ValueError
@@ -423,7 +435,7 @@ class Shell(MutableMapping):
         - setting `pwd` is equivalent to `cd(pwd, expand=False)`
         '''
         if self._pwd is None:
-            out: str = self('pwd', check=True, text=True).stdout
+            out: str = self('\\pwd', check=True, text=True).stdout
             if not out.endswith('\n'):
                 raise ValueError('invalid pwd output')
             self._pwd = out[:-1]
@@ -446,7 +458,7 @@ class Shell(MutableMapping):
     def _get_env(self) -> dict[str, str]:
         '''unsafe env access'''
         if self._env is None:
-            lines = self('env -0', check=True, text=True).stdout.split('\0')
+            lines = self('\\env -0', check=True, text=True).stdout.split('\0')
             tokenized_lines = (line.partition('=') for line in lines if line)
             self._env = {k: v for k, _, v in tokenized_lines}
         return self._env
