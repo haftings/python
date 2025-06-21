@@ -281,7 +281,6 @@ class Shell(MutableMapping):
     '''
     # TODO shell.path: list[str] property
     # TODO shell.ls() -> list[str]
-    # TODO remember excess data between calls to Shell()()
     # TODO make `Shell` a context manager
     # TODO use `weakref` for more robust cleanup
     # TODO add `Shell(tee=True)` to forward stdout to local stdout (after run)
@@ -290,9 +289,11 @@ class Shell(MutableMapping):
         # settings
         self.text = bool(text)
         self._host: str | None = None
+        self._data: bytes = b''
         self._pwd: str | None = None
         self._env: dict[str, str] | None = None
         self._id: bytes = bytes(choices(_ID_CHARS, k=_ID_LENGTH))
+        self._re_msg = re.compile(b'\n([0-9][0-9][0-9])' + self._id + b'\n')
         # make command loop
         id = self._id.decode('utf-8')
         cmd = (
@@ -358,54 +359,44 @@ class Shell(MutableMapping):
         # send the command to remote shell loop
         self._proc.stdin.write(f'{cmd}\0'.encode('utf-8'))
         self._proc.stdin.flush()
-        # read output one block at a time
-        min_len = _ID_LENGTH + 4
-        id_ending = self._id + b'\n'
-        data: list[bytes] = []
-        while block := self._proc.stdout.read1():
-            block_len = len(block)
-            # block is long  enough to contain the ending id string
-            if block_len >= min_len:
-                # ending id string found in block
-                if 0 <= (pos := block.find(id_ending)):
-                    if pos:
-                        data.append(block[:(pos - 4)])
-                    output = b''.join(data)
-                    if text:
-                        output = output.decode(encoding, errors)
-                    if (code := int(block[(pos - 3):pos])) and check:
-                        raise CalledProcessError(code, cmd, output)
-                    return CompletedProcess(cmd, code, output)
-                # ending not found, continue reading
-                else:
-                    data.append(block)
-            # block is too short for an ending, and there's no data to consider
-            elif not data:
-                data.append(block)
-            # block is too short for an ending, but there's data to consider
-            else:
-                # add cached data to block until it's long enough for an ending
-                while data and len(block) < min_len:
-                    block = data.pop() + block
-                # ending id string found in block now
-                if 0 <= (pos := block.find(id_ending)):
-                    if block_len > min_len:
-                        data.append(block[:(pos - 4)])
-                    output = b''.join(data)
-                    if text:
-                        output = output.decode(encoding, errors)
-                    if (code := int(block[(pos - 3):pos])) and check:
-                        raise CalledProcessError(code, cmd, output)
-                    return CompletedProcess(cmd, code, output)
-                # block still has no ending id string
-                else:
-                    data.append(block)
-        # never found an ending
-        output = b''.join(data)
-        if text:
-            output = output.decode(encoding, errors)
-        raise PrematureExit(255, cmd, output)
-        
+        # initialize variables for loop
+        find_msg = self._re_msg.search
+        msg_len = _ID_LENGTH + 5
+        stored_data: list[bytes] = []
+        old_data: bytes = b''
+        new_data: bytes = self._data or b''
+        self._data = b''
+        # reading loop
+        while True:
+            # combine the last two blocks to search for the next set of data
+            data = old_data + new_data if old_data else new_data
+            # search for the trigger msg
+            if r := find_msg(data, max(0, len(old_data) - msg_len)):
+                # parse returncode
+                code = int(r[1])
+                # remember any extra data after trigger msg
+                self._data = data[r.end():]
+                # store data before trigger msg with the rest of the data
+                stored_data.append(data[:r.start()])
+                # return the results
+                output = b''.join(stored_data)
+                if text:
+                    output = output.decode(encoding, errors)
+                return CompletedProcess(cmd, code, output)
+            # bump old_data into the storage list
+            if old_data:
+                stored_data.append(old_data)
+            old_data = new_data
+            # read the next new_data block
+            if not (new_data := self._proc.stdout.read1()):
+                # EOF before trigger msg
+                if old_data:
+                    stored_data.append(old_data)
+                output = b''.join(stored_data)
+                if text:
+                    output = output.decode(encoding, errors)
+                raise PrematureExit(255, cmd, output)
+
     def source(self, path: str, args: Iterable[str] = ()) -> CompletedProcess:
         '''equivalent to `run(['source', path, **args])`'''
         return self(['source', path, *args])
