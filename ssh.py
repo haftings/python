@@ -279,7 +279,6 @@ class Shell(MutableMapping):
         remote_environ = dict(sh)        # get the full environment dict
     ```
     '''
-    # TODO shell.path: list[str] property
     # TODO shell.ls() -> list[str]
     # TODO make `Shell` a context manager
     # TODO use `weakref` for more robust cleanup
@@ -327,6 +326,9 @@ class Shell(MutableMapping):
                 self._proc.kill()
                 self._proc.wait()
             self._proc = None
+
+    # alias for shell terminology
+    exit = close
 
     @property
     def closed(self) -> bool:
@@ -425,6 +427,17 @@ class Shell(MutableMapping):
     @pwd.setter
     def pwd(self, path: str):
         self.cd(path)
+
+    @property
+    def path(self) -> tuple[str, ...]:
+        '''tuple of the remote shell's executable search paths
+        
+        - may be set with a similar tuple or a scalar string
+        '''
+        return tuple(self._get_env().get('PATH', '').split(':'))
+    @path.setter
+    def path(self, path: str | tuple[str, ...]):
+        self['PATH'] = ':'.join([path] if isinstance(path, str) else path)
 
     def _get_env(self) -> dict[str, str]:
         '''unsafe env access'''
