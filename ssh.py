@@ -18,7 +18,6 @@ import weakref
 # TODO Shell.shell: NamedTuple with shell name, version, details
 # TODO     Ref: https://www.gnu.org/savannah-checkouts/gnu/autoconf/manual/autoconf-2.72/autoconf.html#Portable-Shell
 # TODO Shell bash shopt wrapper
-# TODO: host.rsync
 
 _DIGITS = frozenset(b'0123456789')
 _ID_CHARS = b'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz@_'
@@ -60,6 +59,45 @@ _SEARCH_UNSAFE = re.compile(r'[^\w@%+=:,./\n-]', re.ASCII).search
 
 
 def NOOP(*args, **kwargs) -> None: '"no operation" function that does nothing'
+
+
+class RsyncEvent(NamedTuple):
+    '''an event from a running rsync command'''
+
+    event: Literal['file', 'update', 'unknown'] | str
+    '''type of event
+
+    - `file` for the start of a file transfer
+    - `update` for a progress update
+    - `unknown` for an unrecognized event
+    '''
+
+    name: str | None = None
+    '''file name or path'''
+
+    bytes_sent: int | None = None
+    '''bytes sent so far'''
+
+    percent_complete: float | None = None
+    '''percent complete so far, rounded, can be NaN e.g. for 0-length files'''
+
+    bps: float | None = None
+    '''transfer rate in bits per second'''
+
+    eta: timedelta | None = None
+    '''estimated time of arrival (upload or download)'''
+
+    transfer_number: int | None = None
+    '''rsync transfer number, starts with 1'''
+
+    n_checked: int | None = None
+    '''number of files checked, starts with 0, does not include current file'''
+
+    n_total: int | None = None
+    '''number of files to check in all, includes all files and directories'''
+
+    raw: bytes = b''
+    '''the raw binary output from rsync used to infer this event'''
 
 
 class Host:
@@ -131,33 +169,62 @@ class Host:
             self._proc.wait()
             self._proc = None
 
-    def __call__(
-        self, cmd: Iterable[str] | str, *,
-        check: bool = False,
-        text: bool | None = None,
-        encoding: str | None = None,
-        errors: str | None = None,
-        stdin: int | IO | None = None,
-        stdout: int | IO | None = None,
-        stderr: int | IO | None = None,
-        input: str | bytes | None = None,
-        capture_output: bool = False,
-        bufsize: int = -1,
-        pipesize: int = -1,
-        cwd: str | None = None,
-        shell: bool = False
-    ) -> CompletedProcess:
-        '''run a command on the remote host, similar to `subprocess.run`
-
-        - `cwd` changes the remote directory before execution
-        - other arguments work the same as for `subprocess.run`
+    def rsync_upload(
+        self,
+        local_path: str | Iterable[str],
+        remote_path: str = '',
+        arg: str = '-ac', *args: str,
+        verbose: bool = False,
+        callback: Callable[[RsyncEvent], None] = NOOP,
+        **opts: str | int | float | bool
+    ):
+        '''rsync files from `local_path` to `remote_path`
+        
+        - see `rsync` for more details
         '''
-        return run(
-            self._host, cmd, shell=shell, cwd=cwd,
-            check=check, text=text, encoding=encoding, errors=errors,
-            stdin=stdin, stdout=stdout, stderr=stderr,
-            input=input, capture_output=capture_output,
-            bufsize=bufsize, pipesize=pipesize, **(_MULTIPLEX_OPTS | self.opts)
+        return rsync(
+            local_path, f'{self._host}:{remote_path}',
+            arg, *args, verbose=verbose, callback=callback, **opts
+        )
+
+    def rsync_download(
+        self,
+        remote_path: str | Iterable[str],
+        local_path: str = '.',
+        arg: str = '-ac', *args: str,
+        verbose: bool = False,
+        callback: Callable[[RsyncEvent], None] = NOOP,
+        **opts: str | int | float | bool
+    ):
+        '''rsync files from `remote_path` to `local_path`
+        
+        - see `rsync` for more details
+        '''
+        if isinstance(remote_path, str):
+            source_path = f'{self._host}:{remote_path}'
+        else:
+            source_path = [f'{self._host}:{path}' for path in remote_path]
+        return rsync(
+            source_path, local_path,
+            arg, *args, verbose=verbose, callback=callback, **opts
+        )
+
+    def open(
+        self, path: str, mode: _MODE_STR = 'r', *,
+        encoding: str = 'UTF-8', errors='replace',
+        verbose: bool = False, **opts: str | int | float | bool,
+    ) -> TextIOWrapper | BufferedIOBase:
+        '''open a file-like object for a remote file over SSH
+
+        - any valid combination of read, write, append, text,
+          and binary is allowed
+        - seeking and `+` modes are not allowed
+        - `opts` keywords set `ssh_config` options, e.g. `port=22`
+        - `verbose` sends and remote STDERR error output to the python STDOUT
+        '''
+        return open(
+            self._host, path, mode, encoding=encoding, errors=errors,
+            verbose=verbose, **(_MULTIPLEX_OPTS | self.opts)
         )
 
     def Popen(
@@ -186,22 +253,33 @@ class Host:
             bufsize=bufsize, pipesize=pipesize, **(_MULTIPLEX_OPTS | self.opts)
         )
 
-    def open(
-        self, path: str, mode: _MODE_STR = 'r', *,
-        encoding: str = 'UTF-8', errors='replace',
-        verbose: bool = False, **opts: str | int | float | bool,
-    ) -> TextIOWrapper | BufferedIOBase:
-        '''open a file-like object for a remote file over SSH
+    def __call__(
+        self, cmd: Iterable[str] | str, *,
+        check: bool = False,
+        text: bool | None = None,
+        encoding: str | None = None,
+        errors: str | None = None,
+        stdin: int | IO | None = None,
+        stdout: int | IO | None = None,
+        stderr: int | IO | None = None,
+        input: str | bytes | None = None,
+        capture_output: bool = False,
+        bufsize: int = -1,
+        pipesize: int = -1,
+        cwd: str | None = None,
+        shell: bool = False
+    ) -> CompletedProcess:
+        '''run a command on the remote host, similar to `subprocess.run`
 
-        - any valid combination of read, write, append, text,
-          and binary is allowed
-        - seeking and `+` modes are not allowed
-        - `opts` keywords set `ssh_config` options, e.g. `port=22`
-        - `verbose` sends and remote STDERR error output to the python STDOUT
+        - `cwd` changes the remote directory before execution
+        - other arguments work the same as for `subprocess.run`
         '''
-        return open(
-            self._host, path, mode, encoding=encoding, errors=errors,
-            verbose=verbose, **(_MULTIPLEX_OPTS | self.opts)
+        return run(
+            self._host, cmd, shell=shell, cwd=cwd,
+            check=check, text=text, encoding=encoding, errors=errors,
+            stdin=stdin, stdout=stdout, stderr=stderr,
+            input=input, capture_output=capture_output,
+            bufsize=bufsize, pipesize=pipesize, **(_MULTIPLEX_OPTS | self.opts)
         )
 
 
@@ -786,21 +864,6 @@ class Shell(MutableMapping):
         return self._get_env() == other
     def __ne__(self, other):
         return self._get_env() != other
-
-
-class RsyncEvent(NamedTuple):
-    '''an event from a running rsync command'''
-    # TODO make event a literal str set
-    event: str
-    name: str | None = None
-    bytes_sent: int | None = None
-    percent_complete: float | None = None
-    bps: float | None = None
-    eta: timedelta | None = None
-    transfer_number: int | None = None
-    n_checked: int | None = None
-    n_total: int | None = None
-    raw: bytes = b''
 
 
 def _rsync_events(file: BufferedIOBase | bytes) -> Generator[RsyncEvent]:
