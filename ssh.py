@@ -309,7 +309,6 @@ class Shell(MutableMapping):
       - intended to work as generally as possible, but your milage may vary
     - assumes that shell flushes after `printf` newlines, may break otherwise
     '''
-    # TODO use `weakref` for more robust cleanup
     # TODO Shell.shell: NamedTuple with shell name, version, details
     # TODO  Ref: https://www.gnu.org/savannah-checkouts/gnu/autoconf/manual/autoconf-2.72/autoconf.html#Portable-Shell
     # TODO bash shopt wrapper
@@ -375,7 +374,7 @@ class Shell(MutableMapping):
             )
         # test new connection to ensure that everything is working
         cmd = rf'''trap 'printf "\377%03d{id}\377" "$?"' EXIT'''
-        if (out := self(cmd, check=True).stdout) != '':
+        if (out := self(cmd, check=True, tee=False).stdout) != '':
             self.close()
             raise CalledProcessError(1, cmd, f'unexpected output: {out!r}')
 
@@ -470,9 +469,26 @@ class Shell(MutableMapping):
         output = ('' if text else b'').join(data) if capture else None
         raise PrematureExit(255, cmd, output)
 
-    def source(self, path: str, args: Iterable[str] = ()) -> CompletedProcess:
-        '''equivalent to `run(['source', path, **args])`'''
-        return self(['source', path, *args])
+    def source(
+        self,
+        path: str,
+        args: Iterable[str] = (),
+        check: bool = False,
+        *,
+        text: bool | None = None,
+        encoding: str = 'UTF-8',
+        errors: str = 'replace',
+        tee: (
+            None | bool | IOBase | Callable[[str], Any] | Callable[[bytes], Any]
+        ) = None,
+        capture: bool = True
+
+    ) -> CompletedProcess:
+        '''equivalent to `run(['source', path, *args], ...)`'''
+        return self(
+            ['source', path, *args], check, tee=tee, capture=capture,
+            text=text, encoding=encoding, errors=errors
+        )
 
     def ls(self, dir: str = '') -> tuple[str, ...]:
         '''list remote directory'''
@@ -480,7 +496,7 @@ class Shell(MutableMapping):
             cmd = f'(\\cd {_quote(dir)} && \\find . -maxdepth 1 -print0)'
         else:
             cmd = '\\find . -maxdepth 1 -print0'
-        output = self(cmd, check=True, text=True).stdout
+        output = self(cmd, check=True, text=True, tee=False).stdout
         return tuple(sorted({
             name[2:] if name[:2] == './' else name
             for name in output.split('\0') if name not in '..'
@@ -489,7 +505,7 @@ class Shell(MutableMapping):
     def cd(self, path: str = '') -> str:
         '''change remote present working directory, returns the new `pwd`'''
         cmd = f'\\cd {_quote(path)} && \\pwd' if path else '\\cd && \\pwd'
-        out: str = self(cmd, check=True, text=True).stdout
+        out: str = self(cmd, check=True, text=True, tee=False).stdout
         if not out.endswith('\n'):
             raise ValueError
         self._pwd = out[:-1]
@@ -502,7 +518,7 @@ class Shell(MutableMapping):
         - setting `pwd` is equivalent to `cd(pwd, expand=False)`
         '''
         if self._pwd is None:
-            out: str = self('\\pwd', check=True, text=True).stdout
+            out: str = self('\\pwd', check=True, text=True, tee=False).stdout
             if not out.endswith('\n'):
                 raise ValueError('invalid pwd output')
             self._pwd = out[:-1]
@@ -525,11 +541,14 @@ class Shell(MutableMapping):
     def _get_env(self) -> dict[str, str]:
         '''unsafe env access'''
         if self._env is None:
-            lines = self('\\env -0', check=True, text=True).stdout.split('\0')
-            tokenized_lines = (line.partition('=') for line in lines if line)
-            self._env = {k: v for k, _, v in tokenized_lines}
+            self._env = {
+                k: v for k, _, v in (
+                    line.partition('=') for line in self(
+                        '\\env -0', check=True, text=True, tee=False
+                    ).stdout.split('\0') if line
+                )
+            }
         return self._env
-
 
     def __setitem__(self, key: str, value: str):
         # ensure valid key and value
@@ -543,7 +562,7 @@ class Shell(MutableMapping):
             else:
                 raise ValueError(f'invalid environment value: {value!r}')
         # set on remote shell
-        self(['export', f'{key}={value}'], check=True)
+        self(['export', f'{key}={value}'], check=True, tee=False)
         # set in local cache
         if self._env is not None:
             self._env[key] = value
@@ -553,7 +572,7 @@ class Shell(MutableMapping):
         if not _IS_VALID_ENV_VAR_NAME(key):
             raise ValueError(f'invalid environment variable name: {key}')
         # set on remote shell
-        self(f'unset {key}', check=True)
+        self(f'unset {key}', check=True, tee=False)
         # set in local cache
         if self._env is not None:
             try:
