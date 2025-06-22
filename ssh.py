@@ -2,22 +2,18 @@
 
 '''Manage jobs across multiple processes and hosts'''
 
-import re
+from collections.abc import Callable, Generator, Iterable, Iterator
+from collections.abc import MutableMapping
 from datetime import timedelta
 from io import BytesIO, BufferedIOBase, TextIOWrapper, IOBase
 from random import choices
+import re
+from subprocess import CompletedProcess, CalledProcessError
 from subprocess import DEVNULL, PIPE, STDOUT, TimeoutExpired
 from subprocess import Popen as _Popen, run as _run
-from subprocess import CompletedProcess, CalledProcessError
-from typing import NamedTuple, Literal, IO, Any
-from collections.abc import Callable, Generator, Iterable, Iterator
-from collections.abc import MutableMapping
 import sys
+from typing import NamedTuple, Literal, IO, Any
 import weakref
-
-# TODO Shell.shell: NamedTuple with shell name, version, details
-# TODO     Ref: https://www.gnu.org/savannah-checkouts/gnu/autoconf/manual/autoconf-2.72/autoconf.html#Portable-Shell
-# TODO Shell bash shopt wrapper
 
 _DIGITS = frozenset(b'0123456789')
 _ID_CHARS = b'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz@_'
@@ -515,6 +511,22 @@ class Shell(MutableMapping):
         self.capture = capture
         '''include output data/text in response `stdout`'''
 
+        self.shell = ''
+        '''apparent shell being used on remote host
+        
+        - determined by `$0`, typically sh, bash, dash, ksh, zsh
+        - currently determined only at shell launch
+          (may become dynamic in a later release)
+        '''
+
+        self.shell_version = ''
+        '''apparent shell version being used on remote host
+
+        - determined by `$0` and the respective `_VERSION` env variable
+        - currently determined only at shell launch
+          (may become dynamic in a later release)
+        '''
+
         self._host: str | Host = host
         self._data: bytes = b''
         self._pwd: str | None = None
@@ -530,13 +542,18 @@ class Shell(MutableMapping):
         self._id: bytes = bytes(choices(_ID_CHARS, k=22))
         id = self._id.decode('utf-8')
         cmd = (
-            'while \\read -r -d \'\' CMD; do'  # read null-separated inputs
-            ' \\eval "$CMD";'  # run each input command
-            f' \\printf \'\\377%03d{id}\\377\' "$?";'  # report (returncode, ID)
-            ' done 2>&1'  # redirect stderr remote-side to avoid race condition
+            # trap exit signals
+            rf'''trap 'printf "\377%03d{id}\377" "$?"' EXIT && '''
+            # read null-separated inputs
+            'while \\read -r -d \'\' CMD; do'
+            # run each input command
+            ' \\eval "$CMD";'
+            # report (returncode, ID)
+            f' \\printf \'\\377%03d{id}\\377\' "$?";'
+            # redirect stderr remote-side to avoid race conditions
+            ' done 2>&1'
         )
         # start SSH
-        kwargs = dict(shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT)
         if isinstance(self._host, Host):
             self._proc = self._host.Popen(
                 cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT
@@ -547,10 +564,14 @@ class Shell(MutableMapping):
                 cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT
             )
         # test new connection to ensure that everything is working
-        cmd = rf'''trap 'printf "\377%03d{id}\377" "$?"' EXIT'''
-        if (out := self(cmd, check=True, tee=False).stdout) != '':
-            self.close()
-            raise CalledProcessError(1, cmd, f'unexpected output: {out!r}')
+        out = self('printf "%s" "$0"', check=True, text=True, tee=False).stdout
+        self.shell = out.rpartition('/')[2].lstrip('-')
+        self.shell_version = ''
+        if _IS_VALID_ENV_VAR_NAME(self.shell):
+            cmd = f'printf "%s" "${{{self.shell.upper()}_VERSION}}"'
+            v = self(cmd, check=True, text=True, tee=False).stdout
+            self.shell_version = v
+
 
     def close(self, timeout: int | float = 10):
         '''exit the shell, SIGTERM until `timeout`, then KILL if needed'''
