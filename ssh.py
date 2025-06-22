@@ -171,16 +171,15 @@ class Host:
         remote_path: str = '',
         arg: str = '-ac', *args: str,
         verbose: bool = False,
-        callback: Callable[[RsyncEvent], None] = NOOP,
-        **opts: str | int | float | bool
+        callback: Callable[[RsyncEvent], None] = NOOP
     ):
         '''rsync files from `local_path` to `remote_path`
         
         - see `rsync` for more details
         '''
         return rsync(
-            local_path, f'{self._host}:{remote_path}',
-            arg, *args, verbose=verbose, callback=callback, **opts
+            local_path, f'{self._host}:{remote_path}', arg, *args,
+            verbose=verbose, callback=callback, **(_MULTIPLEX_OPTS | self.opts)
         )
 
     def rsync_download(
@@ -189,8 +188,7 @@ class Host:
         local_path: str = '.',
         arg: str = '-ac', *args: str,
         verbose: bool = False,
-        callback: Callable[[RsyncEvent], None] = NOOP,
-        **opts: str | int | float | bool
+        callback: Callable[[RsyncEvent], None] = NOOP
     ):
         '''rsync files from `remote_path` to `local_path`
         
@@ -201,8 +199,8 @@ class Host:
         else:
             source_path = [f'{self._host}:{path}' for path in remote_path]
         return rsync(
-            source_path, local_path,
-            arg, *args, verbose=verbose, callback=callback, **opts
+            source_path, local_path, arg, *args,
+            verbose=verbose, callback=callback, **(_MULTIPLEX_OPTS | self.opts)
         )
 
     def open(
