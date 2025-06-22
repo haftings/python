@@ -309,7 +309,6 @@ class Shell(MutableMapping):
       - intended to work as generally as possible, but your milage may vary
     - assumes that shell flushes after `printf` newlines, may break otherwise
     '''
-    # TODO make `Shell` a context manager
     # TODO use `weakref` for more robust cleanup
     # TODO Shell.shell: NamedTuple with shell name, version, details
     # TODO  Ref: https://www.gnu.org/savannah-checkouts/gnu/autoconf/manual/autoconf-2.72/autoconf.html#Portable-Shell
@@ -347,24 +346,32 @@ class Shell(MutableMapping):
         self._data: bytes = b''
         self._pwd: str | None = None
         self._env: dict[str, str] | None = None
-        self._id: bytes = bytes(choices(_ID_CHARS, k=22))
-        self._re_msg = re.compile(b'([0-9][0-9][0-9])' + self._id + b'\n')
+        self._id: bytes = b''
+        self._proc: _Popen | None = None
+
+    def connect(self):
+        '''connect to the shell with a call to `ssh`'''
+        if self._proc:
+            raise CalledProcessError(1, 'ssh', 'shell already connected')
         # make command loop
+        self._id: bytes = bytes(choices(_ID_CHARS, k=22))
         id = self._id.decode('utf-8')
         cmd = (
-            'while \\read -r -d \'\' CMD; do'      # read null-separated inputs
-            ' \\eval "$CMD";'                      # run each input command
+            'while \\read -r -d \'\' CMD; do'  # read null-separated inputs
+            ' \\eval "$CMD";'  # run each input command
             f' \\printf \'\\377%03d{id}\\377\' "$?";'  # report (returncode, ID)
             ' done 2>&1'  # redirect stderr remote-side to avoid race condition
         )
         # start SSH
-        if isinstance(host, SSH):
-            self._proc = host.Popen(
+        kwargs = dict(shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT)
+        if isinstance(self._host, SSH):
+            self._proc = self._host.Popen(
                 cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT
             )
         else:
             self._proc = Popen(
-                host, cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT
+                self._host,
+                cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT
             )
         # test new connection to ensure that everything is working
         cmd = rf'''trap 'printf "\377%03d{id}\377" "$?"' EXIT'''
@@ -389,6 +396,13 @@ class Shell(MutableMapping):
     @property
     def closed(self) -> bool:
         return not (self._proc and self._proc.poll() is None)
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type=None, exc_value=None, traceback=None):
+        self.close()
 
     def __call__(
         self,
@@ -422,13 +436,13 @@ class Shell(MutableMapping):
                 tee = tee_func
             elif not isinstance(tee, Callable):
                 tee = _write_flush_stdout if text else _write_flush_stdout_b
-        # require process to be initialized
+        # require process to be well-connected
         if not (
             self._proc and self._proc.poll() is None
             and isinstance(self._proc.stdin, BufferedIOBase)
             and isinstance(self._proc.stdout, BufferedIOBase)
         ):
-            raise ValueError('Shell not initialized')
+            raise ValueError('Shell not ready (may need to be connected first)')
         # convert command to shell token string
         if not isinstance(cmd, str):
             cmd = ' '.join(map(_quote, cmd))
