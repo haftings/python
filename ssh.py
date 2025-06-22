@@ -312,7 +312,6 @@ class Shell(MutableMapping):
     # TODO Shell.shell: NamedTuple with shell name, version, details
     # TODO  Ref: https://www.gnu.org/savannah-checkouts/gnu/autoconf/manual/autoconf-2.72/autoconf.html#Portable-Shell
     # TODO bash shopt wrapper
-    # TODO shell.exists(path) test for file existence
 
     def __init__(
         self,
@@ -490,13 +489,25 @@ class Shell(MutableMapping):
             text=text, encoding=encoding, errors=errors
         )
 
-    def ls(self, dir: str = '') -> tuple[str, ...]:
+    def ls(self, path: str = '') -> tuple[str, ...]:
         '''list remote directory'''
-        if dir and dir not in '.':
-            cmd = f'(\\cd {_quote(dir)} && \\find . -maxdepth 1 -print0)'
+        # construct ls-like command with machine-readable output
+        if path and path not in '.':
+            qpath = _quote(path)
+            cmd = (
+                # test if path is a non-directory file
+                f'\\[ -e {qpath} -a \\! -d {qpath} ]'
+                # if so, then print the file alone
+                f' && printf "%s\\0" {qpath}'
+                # otherwise, cd to the directory and run find
+                f' || (\\cd {_quote(path)} && \\find . -maxdepth 1 -print0)'
+            )
         else:
+            # a find without cd-ing works for the current (.) directory
             cmd = '\\find . -maxdepth 1 -print0'
+        # run the command
         output = self(cmd, check=True, text=True, tee=False).stdout
+        # convert to sorted tuple, and cut off leading ./ from find
         return tuple(sorted({
             name[2:] if name[:2] == './' else name
             for name in output.split('\0') if name not in '..'
