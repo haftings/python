@@ -21,7 +21,7 @@ MODE_STR = Literal[
     'a', 'at', 'ta', 'ab', 'ba'
 ]
 _ID_CHARS = b'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz@_'
-_ID_LENGTH = 22
+_DIGIT_CHAR_SET = frozenset(b'0123456789')
 _RE_RSYNC_ESCAPE = re.compile(rb'\\#([0-7][0-7][0-7])')
 _RE_RSYNC = re.compile(rb'''
     # file_name\n
@@ -309,14 +309,12 @@ class Shell(MutableMapping):
       - intended to work as generally as possible, but your milage may vary
     - assumes that shell flushes after `printf` newlines, may break otherwise
     '''
-    # TODO change PrematureExit to another name, if it makes sense
     # TODO make `Shell` a context manager
     # TODO use `weakref` for more robust cleanup
     # TODO Shell.shell: NamedTuple with shell name, version, details
     # TODO  Ref: https://www.gnu.org/savannah-checkouts/gnu/autoconf/manual/autoconf-2.72/autoconf.html#Portable-Shell
     # TODO bash shopt wrapper
     # TODO shell.exists(path) test for file existence
-    # TODO add `Shell(tee=True)` to forward stdout to local stdout (after run)
 
     def __init__(
         self,
@@ -349,14 +347,14 @@ class Shell(MutableMapping):
         self._data: bytes = b''
         self._pwd: str | None = None
         self._env: dict[str, str] | None = None
-        self._id: bytes = bytes(choices(_ID_CHARS, k=_ID_LENGTH))
+        self._id: bytes = bytes(choices(_ID_CHARS, k=22))
         self._re_msg = re.compile(b'([0-9][0-9][0-9])' + self._id + b'\n')
         # make command loop
         id = self._id.decode('utf-8')
         cmd = (
             'while \\read -r -d \'\' CMD; do'      # read null-separated inputs
             ' \\eval "$CMD";'                      # run each input command
-            f' \\printf \'%03d{id}\\n\' "$?";'  # report (returncode, ID)
+            f' \\printf \'\\377%03d{id}\\377\' "$?";'  # report (returncode, ID)
             ' done 2>&1'  # redirect stderr remote-side to avoid race condition
         )
         # start SSH
@@ -369,7 +367,7 @@ class Shell(MutableMapping):
                 host, cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT
             )
         # test new connection to ensure that everything is working
-        cmd = rf'''trap 'printf "%03d{id}\n" "$?"' EXIT'''
+        cmd = rf'''trap 'printf "\377%03d{id}\377" "$?"' EXIT'''
         if (out := self(cmd, check=True).stdout) != '':
             self.close()
             raise CalledProcessError(1, cmd, f'unexpected output: {out!r}')
@@ -439,32 +437,24 @@ class Shell(MutableMapping):
         # send the command to remote shell loop
         self._proc.stdin.write(f'{cmd}\0'.encode('utf-8'))
         self._proc.stdin.flush()
-        # initialize variables for loop
-        find_msg = self._re_msg.search
-        storage = [] if capture else None
-        if self._data:
-            _handle_output(self._data, text, tee, storage, encoding, errors)
-            self._data = b''
-        # reading loop
-        while data := self._proc.stdout.read1():
-            # search for the trigger msg
-            if r := find_msg(data):
-                # parse returncode
-                code = int(r[1])
-                # remember any extra data after trigger msg
-                self._data = data[r.end():]
-                # store data before trigger msg with the rest of the data
-                data = data[:r.start()]
-                _handle_output(data, text, tee, storage, encoding, errors)
-                # return result
-                output = _join_output(capture, text, storage)
-                if code and check:
-                    raise CalledProcessError(code, cmd, output)
-                return CompletedProcess(cmd, code, output)
-            # bump data into storage
-            _handle_output(data, text, tee, storage, encoding, errors)
+        # loop over output
+        data = []
+        for msg in _iter_output(self._proc.stdout, self._id, capture):
+            if isinstance(msg, int):
+                output = ('' if text else b'').join(data) if capture else None
+                if check and msg:
+                    raise CalledProcessError(msg, cmd, output)
+                return CompletedProcess(cmd, msg, output)
+            elif tee or capture:
+                msg = msg.decode(encoding, errors) if text else msg
+                if tee:
+                    (sys.stdout if text else sys.stdout.buffer).write(msg)
+                    sys.stdout.flush()
+                if capture:
+                    data.append(msg)
         # EOF before trigger msg
-        raise PrematureExit(255, cmd, _join_output(capture, text, storage))
+        output = ('' if text else b'').join(data) if capture else None
+        raise PrematureExit(255, cmd, output)
 
     def source(self, path: str, args: Iterable[str] = ()) -> CompletedProcess:
         '''equivalent to `run(['source', path, **args])`'''
@@ -579,6 +569,74 @@ class Shell(MutableMapping):
         return self._get_env() == other
     def __ne__(self, other):
         return self._get_env() != other
+
+
+def _iter_output(stream: BufferedIOBase, id: bytes, capture: bool) -> Iterator:
+    '''yield blocks of data from stream, or returncode'''
+    # msg format is: \377 {code:03d} {id:22} \377
+    # loop through read1()
+    prev_data = b''
+    while data := stream.read1():
+        # bring in any possible partial msg from previous loop(s)
+        if prev_data:
+            data = prev_data + data
+            prev_data = b''
+        # loop through and \xFF instances inside string
+        n = len(data)
+        i = 0
+        while 0 <= (i := data.find(b'\377', i)):
+            # check for returncode and ID character match
+            if (
+                all(char in _DIGIT_CHAR_SET for char in data[(i + 1):(i + 4)])
+                and (id_maybe := data[(i + 4):(i + 26)]) == id[:len(id_maybe)]
+                and data[(i + 26):(i + 27)] == b'\377'
+            ):
+                # yield data before possible msg
+                if i and capture:
+                    yield data[:i]
+                # possible msg intersects with end of block
+                if i + 26 >= n:
+                    # remember possible msg for next read1() cycle
+                    prev_data = data[i:]
+                    break
+                # found a returncode msg
+                else:
+                    # yield returncode (int)
+                    yield int(data[(i + 1):(i + 4)])
+                    # remember any remaining data for next read1() cycle
+                    prev_data = data[(i + 26):]
+                    break
+            i += 1
+        # no possible msg found
+        else:
+            if capture:
+                # check for incomplete UTF-8 sequence
+                u = data[-3:].rjust(3)
+                # 1 of 2-char sequence
+                if u[2] & 0b11100000 == 0b11000000:
+                    prev_data = data[-1:]
+                    if n > 1:
+                        yield data[:-1]
+                # 2 of 3-char sequence
+                elif (
+                    u[1] & 0b11110000 == 0b11100000 and
+                    u[2] & 0b11000000 == 0b10000000
+                ):
+                    prev_data = data[-2:]
+                    if n > 2:
+                        yield data[:-2]
+                # 3 of 4-char sequence
+                elif (
+                    u[0] & 0b11111000 == 0b11110000 and
+                    u[1] & 0b11000000 == 0b10000000 and
+                    u[2] & 0b11000000 == 0b10000000
+                ):
+                    prev_data = data[-3:]
+                    if n > 3:
+                        yield data[:-3]
+                # no chance of breaking a valid UTF-8 sequence otherwise
+                else:
+                    yield data
 
 def _handle_output(data, text, tee, storage, encoding, errors):
     '''selectively decode, write, and store data'''
