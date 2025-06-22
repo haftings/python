@@ -12,7 +12,7 @@ from subprocess import CompletedProcess, CalledProcessError
 from subprocess import DEVNULL, PIPE, STDOUT, TimeoutExpired
 from subprocess import Popen as _Popen, run as _run
 import sys
-from typing import NamedTuple, Literal, IO, Any
+from typing import Literal, IO, Any
 import weakref
 
 _DIGITS = frozenset(b'0123456789')
@@ -57,43 +57,80 @@ _SEARCH_UNSAFE = re.compile(r'[^\w@%+=:,./\n-]', re.ASCII).search
 def NOOP(*args, **kwargs) -> None: '"no operation" function that does nothing'
 
 
-class RsyncEvent(NamedTuple):
+class RsyncEvent:
     '''an event from a running rsync command'''
 
-    event: Literal['file', 'update', 'unknown'] | str
-    '''type of event
+    def __init__(
+        self, 
+        event: Literal['file', 'update', 'unknown'] | str,
+        name: str | None = None,
+        bytes_sent: int | None = None,
+        percent_complete: float | None = None,
+        bps: float | None = None,
+        eta: timedelta | None = None,
+        transfer_number: int | None = None,
+        n_checked: int | None = None,
+        n_total: int | None = None,
+        raw: bytes = b''
+    ):
 
-    - `file` for the start of a file transfer
-    - `update` for a progress update
-    - `unknown` for an unrecognized event
-    '''
+        self.event = event
+        '''type of event
 
-    name: str | None = None
-    '''file name or path'''
+        - `file` for the start of a file transfer
+        - `update` for a progress update
+        - `unknown` for an unrecognized event
+        '''
 
-    bytes_sent: int | None = None
-    '''bytes sent so far'''
+        self.name = name
+        '''file name or path'''
 
-    percent_complete: float | None = None
-    '''percent complete so far, rounded, can be NaN e.g. for 0-length files'''
+        self.bytes_sent = bytes_sent
+        '''bytes sent so far'''
 
-    bps: float | None = None
-    '''transfer rate in bits per second'''
+        self.percent_complete = percent_complete
+        '''completion percent, rounded, can be NaN e.g. for 0-length files'''
 
-    eta: timedelta | None = None
-    '''estimated time of arrival (upload or download)'''
+        self.bps = bps
+        '''transfer rate in bits per second'''
 
-    transfer_number: int | None = None
-    '''rsync transfer number, starts with 1'''
+        self.eta = eta
+        '''estimated time of arrival (upload or download)'''
 
-    n_checked: int | None = None
-    '''number of files checked, starts with 0, does not include current file'''
+        self.transfer_number = transfer_number
+        '''rsync transfer number, starts with 1'''
 
-    n_total: int | None = None
-    '''number of files to check in all, includes all files and directories'''
+        self.n_checked = n_checked
+        '''
+        count of files checked so far,
+        starts with 0, doesn't include current file
+        '''
 
-    raw: bytes = b''
-    '''the raw binary output from rsync used to infer this event'''
+        self.n_total = n_total
+        '''count of files to check in all, includes all files and directories'''
+
+        self.raw = raw
+        '''the raw binary output from rsync used to infer this event'''
+
+    _att_names = (
+        'event',
+        'name',
+        'bytes_sent',
+        'percent_complete',
+        'bps',
+        'eta',
+        'transfer_number',
+        'n_checked',
+        'n_total',
+        'raw'
+    )
+
+    def __repr__(self) -> str:
+        args = []
+        for name in self._att_names:
+            if (v := getattr(self, name)) is not None:
+                args.append(f'{name}={v!r}')
+        return f'{self.__class__.__name__}(' + ', '.join(args) + ')'
 
 
 class Host:
