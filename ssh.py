@@ -15,13 +15,25 @@ from collections.abc import MutableMapping
 import sys
 import weakref
 
-MODE_STR = Literal[
+# TODO Shell.shell: NamedTuple with shell name, version, details
+# TODO     Ref: https://www.gnu.org/savannah-checkouts/gnu/autoconf/manual/autoconf-2.72/autoconf.html#Portable-Shell
+# TODO Shell bash shopt wrapper
+# TODO: host.rsync
+
+_DIGITS = frozenset(b'0123456789')
+_ID_CHARS = b'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz@_'
+_IS_VALID_ENV_VAR_NAME = re.compile(r'[a-zA-Z_][a-zA-Z0-9_]*$').match
+_MODE_STR = Literal[
     'r', 'rt', 'tr', 'rb', 'br',
     'w', 'wt', 'tw', 'wb', 'bw',
     'a', 'at', 'ta', 'ab', 'ba'
 ]
-_ID_CHARS = b'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz@_'
-_DIGIT_CHAR_SET = frozenset(b'0123456789')
+_MULTIPLEX_OPTS: dict[str, str] = {
+    'loglevel': 'error',
+    'controlmaster': 'auto',
+    'controlpath': '~/.ssh/.%u@%h:%p.control',
+    'controlpersist': 'no'
+}
 _RE_RSYNC_ESCAPE = re.compile(rb'\\#([0-7][0-7][0-7])')
 _RE_RSYNC = re.compile(rb'''
     # file_name\n
@@ -45,113 +57,34 @@ _UNITS = {
     b'P': 1024 ** 5, b'E': 1024 ** 6, b'Z': 1024 ** 7, b'Y': 1024 ** 8
 }
 _SEARCH_UNSAFE = re.compile(r'[^\w@%+=:,./\n-]', re.ASCII).search
-_MULTIPLEX_OPTS: dict[str, str] = {
-    'loglevel': 'error',
-    'controlmaster': 'auto',
-    'controlpath': '~/.ssh/.%u@%h:%p.control',
-    'controlpersist': 'no'
-}
-_IS_VALID_ENV_VAR_NAME = re.compile(r'[a-zA-Z_][a-zA-Z0-9_]*$').match
-
-def noop(*args, **kwargs) -> None:
-    '''"no operation" function that does nothing'''
-
-def _write_flush_stdout(text: str) -> None:
-    '''write text to stdout, flush stdout'''
-    sys.stdout.write(text)
-    sys.stdout.flush()
-
-def _write_flush_stdout_b(data: bytes) -> None:
-    '''write data to stdout, flush stdout'''
-    sys.stdout.buffer.write(data)
-    sys.stdout.flush()
-
-class RsyncEvent(NamedTuple):
-    '''an event from a running rsync command'''
-    event: str
-    name: str | None = None
-    bytes_sent: int | None = None
-    percent_complete: float | None = None
-    bps: float | None = None
-    eta: timedelta | None = None
-    transfer_number: int | None = None
-    n_checked: int | None = None
-    n_total: int | None = None
-    raw: bytes = b''
-
-def rsync_events(file: BufferedIOBase | bytes) -> Generator[RsyncEvent]:
-    '''read rsync events from an rsync process stdout open in binary mode'''
-    if not isinstance(file, BufferedIOBase):
-        file = BytesIO(file)
-    name: str | None = None
-    buff: list[bytes] = []
-    while data := file.read1():
-        buff.append(data)
-        if b'\n' in data or b'\r' in data:
-            if len(buff) > 1:
-                data = b''.join(buff)
-            cursor = 0
-            for r in _RE_RSYNC.finditer(data):
-                cursor = r.end()
-                if r[11]:
-                    event = 'file' if r[12] == b'\n' else 'unknown'
-                    name = rsync_decode(r[11])
-                    yield RsyncEvent(event, name=name, raw=r[0])
-                else:
-                    if r[7]:
-                        h, m, s = int(r[5]), int(r[6]), int(r[7])
-                    else:
-                        h, m, s = 0, int(r[5]), int(r[6])
-                    bps = (float(r[3]) * _UNITS.get(r[4], 1)) if r[3] else None
-                    yield RsyncEvent(
-                        'update',
-                        name=name,
-                        bytes_sent=int(r[1]),
-                        percent_complete=float(r[2]),
-                        bps=bps,
-                        eta=timedelta(hours=h, minutes=m, seconds=s),
-                        transfer_number=(int(r[8]) if r[8] else None),
-                        n_checked=(int(r[9]) if r[9] else None),
-                        n_total=(int(r[10]) if r[10] else None),
-                        raw=r[0]
-                    )
-            buff = [data[cursor:]] if cursor < len(data) else []
-    if buff:
-        name = rsync_decode(b''.join(buff))
-        yield RsyncEvent('unknown', name=name)
-
-def _rsync_decode(r: re.Match) -> bytes:
-    '''convert rsync escape match to a bytes character'''
-    return bytes([int(r[1], 8)])
-
-def rsync_decode(text: bytes) -> str:
-    '''decode rsync text with escapes'''
-    return _RE_RSYNC_ESCAPE.sub(_rsync_decode, text).decode(errors='replace')
 
 
-class SSH:
+def NOOP(*args, **kwargs) -> None: '"no operation" function that does nothing'
+
+
+class Host:
     '''Class to handle SSH connection(s) to a host
 
-    `SSH(...)`
+    `Host(...)`
     - `host` is the hostname and optional username, e.g. `user@host`
     - `opts` keywords set `ssh_config` options, e.g. `port=22`
 
     SSH sessions/connections are formed either once for each SSH operation:
     ```python
-    ssh_host = SSH('user@host')    # no connection/session yet
-    ssh_host(['echo', 'hello'])    # one full ssh session during run #1
-    ssh_hsot(['echo', 'goodbye'])  # second full ssh session during run #2
+    host = Host('user@host')   # no connection/session yet
+    host(['echo', 'hello'])    # one full ssh session during run #1
+    host(['echo', 'goodbye'])  # second full ssh session during run #2
     ```
 
     Or you can form a connection and reuse it using `with`:
     ```python
-    with SSH('user@host') as ssh_host:  # session started
-        ssh_host(['echo', 'hello'])     # uses existing session
-        ssh_host(['echo', 'goodbye'])   # uses existing session again
+    with Host('user@host') as host:  # session started
+        host(['echo', 'hello'])      # uses existing session
+        host(['echo', 'goodbye'])    # uses existing session again
     # session closes at the end of the `with` block
     ```
     '''
-    def __init__(self, host: str, **opts: str) -> None:
+    def __init__(self, host: str, **opts: str | int | float | bool) -> None:
         self._host = str(host) or 'localhost'
         self.opts: dict[str, str | int | float | bool] = dict(opts)
         self._proc: _Popen | None = None
@@ -179,7 +112,7 @@ class SSH:
             # and needs to work in all major shells (bash, sh, ksh, zsh)
             remote_cmd = '\\echo; while \\:; do \\echo >&2; \\sleep 1; done'
             # start the ssh process
-            opts = ssh_opt_args(_MULTIPLEX_OPTS | self.opts)
+            opts = _ssh_opt_args(_MULTIPLEX_OPTS | self.opts)
             cmd = ['ssh', self._host, *opts, remote_cmd]
             self._proc = _Popen(
                 cmd, stderr=DEVNULL, stdout=PIPE, stdin=DEVNULL
@@ -254,7 +187,7 @@ class SSH:
         )
 
     def open(
-        self, path: str, mode: MODE_STR = 'r', *,
+        self, path: str, mode: _MODE_STR = 'r', *,
         encoding: str = 'UTF-8', errors='replace',
         verbose: bool = False, **opts: str | int | float | bool,
     ) -> TextIOWrapper | BufferedIOBase:
@@ -270,6 +203,175 @@ class SSH:
             self._host, path, mode, encoding=encoding, errors=errors,
             verbose=verbose, **(_MULTIPLEX_OPTS | self.opts)
         )
+
+
+class TextFile(TextIOWrapper):
+    '''text file opened over SSH'''
+
+    def __init__(self, proc: _Popen, file: TextIOWrapper):
+        self.proc = proc
+        self.file = file
+        # use weakref so that open(..).write(...) immediately flushes & closes
+        self._finalize = weakref.finalize(
+            self, self._close, self.file, self.proc, CalledProcessError
+        )
+
+    @staticmethod
+    def _close(file: TextIOWrapper, proc: _Popen, CalledProcessError: type):
+        file.close()
+        if returncode := proc.wait():
+            raise CalledProcessError(returncode, proc.args)
+
+    def remove(self):
+        self._finalize()
+
+    @property
+    def removed(self) -> bool:
+        return not self._finalize.alive
+
+    def close(self):
+        self._close(self.file, self.proc, CalledProcessError)
+
+    @property
+    def closed(self) -> bool:
+        return self.file.closed
+
+    def fileno(self) -> int:
+        return self.file.fileno()
+
+    def flush(self):
+        self.file.flush()
+
+    @property
+    def encoding(self) -> str:
+        return self.file.encoding
+
+    @property
+    def errors(self) -> str | None:
+        return self.file.errors
+
+    @property
+    def newlines(self) -> str | tuple[str, ...] | None:
+        return self.file.newlines
+
+    def isatty(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+    def tell(self) -> int:
+        return self.file.tell()
+
+    def readable(self) -> bool:
+        return self.file.readable()
+
+    def read(self, size=-1) -> str:
+        return self.file.read(size)
+
+    def readline(self, size=-1) -> str:
+        return self.file.readline(size)
+
+    def readlines(self, hint: int = -1) -> list[str]:
+        return self.file.readlines(hint)
+
+    def writable(self) -> bool:
+        return self.file.writable()
+
+    def write(self, text: str) -> int:
+        return self.file.write(text)
+
+    def __next__(self) -> str:
+        if line := self.file.readline():
+            return line
+        raise StopIteration
+
+    def __repr__(self) -> str:
+        name = self.__class__.__name__
+        return  f'{name}(proc={self.proc!r}, file={self.file!r})'
+
+
+class BinaryFile(BufferedIOBase):
+    '''binary file opened over SSH'''
+
+    def __init__(self, proc: _Popen, file: BufferedIOBase):
+        self.proc = proc
+        self.file = file
+        # use weakref so that open(..).write(...) immediately flushes & closes
+        self._finalize = weakref.finalize(
+            self, self._close, self.file, self.proc, CalledProcessError
+        )
+
+    @staticmethod
+    def _close(file: BufferedIOBase, proc: _Popen, CalledProcessError: type):
+        file.close()
+        if returncode := proc.wait():
+            raise CalledProcessError(returncode, proc.args)
+
+    def remove(self):
+        self._finalize()
+
+    @property
+    def removed(self) -> bool:
+        return not self._finalize.alive
+
+    def close(self):
+        self._close(self.file, self.proc, CalledProcessError)
+
+    @property
+    def closed(self) -> bool:
+        return self.file.closed
+
+    def fileno(self) -> int:
+        return self.file.fileno()
+
+    def flush(self):
+        self.file.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+    def tell(self) -> int:
+        return self.file.tell()
+
+    def readable(self) -> bool:
+        return self.file.readable()
+
+    def read(self, size=-1) -> bytes:
+        return self.file.read(size)
+
+    def read1(self, size: int = -1) -> bytes:
+        return self.file.read1(size)
+
+    def readinto(self, buffer: bytearray | memoryview) -> int:
+        return self.file.readinto(buffer)
+
+    def readinto1(self, buffer: bytearray | memoryview) -> int:
+        return super().readinto1(buffer)
+
+    def readline(self, size=-1) -> bytes:
+        return self.file.readline(size)
+
+    def readlines(self, hint: int = -1) -> list[bytes]:
+        return self.file.readlines(hint)
+
+    def writable(self) -> bool:
+        return self.file.writable()
+
+    def write(self, data: bytes) -> int:
+        return self.file.write(data)
+
+    def __next__(self) -> bytes:
+        if line := self.file.readline():
+            return line
+        raise StopIteration
+
+    def __repr__(self) -> str:
+        name = self.__class__.__name__
+        return  f'{name}(proc={self.proc!r}, file={self.file!r})'
 
 
 class PrematureExit(CalledProcessError):
@@ -309,21 +411,16 @@ class Shell(MutableMapping):
       - intended to work as generally as possible, but your milage may vary
     - assumes that shell flushes after `printf` newlines, may break otherwise
     '''
-    # TODO Shell.shell: NamedTuple with shell name, version, details
-    # TODO  Ref: https://www.gnu.org/savannah-checkouts/gnu/autoconf/manual/autoconf-2.72/autoconf.html#Portable-Shell
-    # TODO bash shopt wrapper
-
     def __init__(
         self,
-        host: str | SSH,
+        host: str | Host,
         text: bool = True,
         tee: (
             bool | IOBase | Callable[[str], Any] | Callable[[bytes], Any]
         ) = True,
         capture: bool = True
     ):
-        # settings
-        
+
         self.text = bool(text)
         '''set `True` for `str` output, `False` for `bytes` output'''
 
@@ -340,7 +437,7 @@ class Shell(MutableMapping):
         self.capture = capture
         '''include output data/text in response `stdout`'''
 
-        self._host: str | SSH = host
+        self._host: str | Host = host
         self._data: bytes = b''
         self._pwd: str | None = None
         self._env: dict[str, str] | None = None
@@ -362,7 +459,7 @@ class Shell(MutableMapping):
         )
         # start SSH
         kwargs = dict(shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT)
-        if isinstance(self._host, SSH):
+        if isinstance(self._host, Host):
             self._proc = self._host.Popen(
                 cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT
             )
@@ -451,7 +548,7 @@ class Shell(MutableMapping):
         self._proc.stdin.flush()
         # loop over output
         data = []
-        for msg in _iter_output(self._proc.stdout, self._id, capture):
+        for msg in self._iter_output(capture):
             if isinstance(msg, int):
                 output = ('' if text else b'').join(data) if capture else None
                 if check and msg:
@@ -467,6 +564,82 @@ class Shell(MutableMapping):
         # EOF before trigger msg
         output = ('' if text else b'').join(data) if capture else None
         raise PrematureExit(255, cmd, output)
+
+    def _iter_output(self, capture: bool) -> Iterator:
+        '''yield blocks of data from stream, or returncode'''
+        # msg format is: \377 {code:03d} {id:22} \377
+        if not (
+            self._proc and self._proc.poll() is None
+            and isinstance(self._proc.stdout, BufferedIOBase)
+        ):
+            raise ValueError('Shell not ready (may need to be connected first)')
+        # loop through read1()
+        prev_data = b''
+        while data := self._proc.stdout.read1():
+            # bring in any possible partial msg from previous loop(s)
+            if prev_data:
+                data = prev_data + data
+                prev_data = b''
+            # loop through and \xFF instances inside string
+            n = len(data)
+            i = 0
+            while 0 <= (i := data.find(b'\377', i)):
+                # check for returncode and ID character match
+                if (
+                    # first three chars are digits
+                    all(char in _DIGITS for char in data[(i + 1):(i + 4)])
+                    # next 22 chars match `id`
+                    and (id := data[(i + 4):(i + 26)]) == self._id[:len(id)]
+                    # last char is \xFF
+                    and data[(i + 26):(i + 27)] == b'\377'
+                ):
+                    # yield data before possible msg
+                    if i and capture:
+                        yield data[:i]
+                    # possible msg intersects with end of block
+                    if i + 26 >= n:
+                        # remember possible msg for next read1() cycle
+                        prev_data = data[i:]
+                        break
+                    # found a returncode msg
+                    else:
+                        # yield returncode (int)
+                        yield int(data[(i + 1):(i + 4)])
+                        # remember any remaining data for next read1() cycle
+                        prev_data = data[(i + 26):]
+                        break
+                i += 1
+            # no possible msg found
+            else:
+                if capture:
+                    # check for incomplete UTF-8 sequence
+                    u = data[-3:].rjust(3)
+                    # 1 of 2-char sequence
+                    if u[2] & 0b11100000 == 0b11000000:
+                        prev_data = data[-1:]
+                        if n > 1:
+                            yield data[:-1]
+                    # 2 of 3-char sequence
+                    elif (
+                        u[1] & 0b11110000 == 0b11100000 and
+                        u[2] & 0b11000000 == 0b10000000
+                    ):
+                        prev_data = data[-2:]
+                        if n > 2:
+                            yield data[:-2]
+                    # 3 of 4-char sequence
+                    elif (
+                        u[0] & 0b11111000 == 0b11110000 and
+                        u[1] & 0b11000000 == 0b10000000 and
+                        u[2] & 0b11000000 == 0b10000000
+                    ):
+                        prev_data = data[-3:]
+                        if n > 3:
+                            yield data[:-3]
+                    # no chance of breaking a valid UTF-8 sequence otherwise
+                    else:
+                        yield data
+
 
     def source(
         self,
@@ -525,7 +698,7 @@ class Shell(MutableMapping):
     @property
     def pwd(self) -> str:
         '''remote present working directory
-        
+
         - setting `pwd` is equivalent to `cd(pwd, expand=False)`
         '''
         if self._pwd is None:
@@ -541,7 +714,7 @@ class Shell(MutableMapping):
     @property
     def path(self) -> tuple[str, ...]:
         '''tuple of the remote shell's executable search paths
-        
+
         - may be set with a similar tuple or a scalar string
         '''
         return tuple(self._get_env().get('PATH', '').split(':'))
@@ -577,7 +750,7 @@ class Shell(MutableMapping):
         # set in local cache
         if self._env is not None:
             self._env[key] = value
-    
+
     def __delitem__(self, key: str):
         # ensure valid key
         if not _IS_VALID_ENV_VAR_NAME(key):
@@ -615,103 +788,197 @@ class Shell(MutableMapping):
         return self._get_env() != other
 
 
-def _iter_output(stream: BufferedIOBase, id: bytes, capture: bool) -> Iterator:
-    '''yield blocks of data from stream, or returncode'''
-    # msg format is: \377 {code:03d} {id:22} \377
-    # loop through read1()
-    prev_data = b''
-    while data := stream.read1():
-        # bring in any possible partial msg from previous loop(s)
-        if prev_data:
-            data = prev_data + data
-            prev_data = b''
-        # loop through and \xFF instances inside string
-        n = len(data)
-        i = 0
-        while 0 <= (i := data.find(b'\377', i)):
-            # check for returncode and ID character match
-            if (
-                all(char in _DIGIT_CHAR_SET for char in data[(i + 1):(i + 4)])
-                and (id_maybe := data[(i + 4):(i + 26)]) == id[:len(id_maybe)]
-                and data[(i + 26):(i + 27)] == b'\377'
-            ):
-                # yield data before possible msg
-                if i and capture:
-                    yield data[:i]
-                # possible msg intersects with end of block
-                if i + 26 >= n:
-                    # remember possible msg for next read1() cycle
-                    prev_data = data[i:]
-                    break
-                # found a returncode msg
+class RsyncEvent(NamedTuple):
+    '''an event from a running rsync command'''
+    # TODO make event a literal str set
+    event: str
+    name: str | None = None
+    bytes_sent: int | None = None
+    percent_complete: float | None = None
+    bps: float | None = None
+    eta: timedelta | None = None
+    transfer_number: int | None = None
+    n_checked: int | None = None
+    n_total: int | None = None
+    raw: bytes = b''
+
+
+def _rsync_events(file: BufferedIOBase | bytes) -> Generator[RsyncEvent]:
+    '''read rsync events from an rsync process stdout open in binary mode'''
+    if not isinstance(file, BufferedIOBase):
+        file = BytesIO(file)
+    name: str | None = None
+    buff: list[bytes] = []
+    while data := file.read1():
+        buff.append(data)
+        if b'\n' in data or b'\r' in data:
+            if len(buff) > 1:
+                data = b''.join(buff)
+            cursor = 0
+            for r in _RE_RSYNC.finditer(data):
+                cursor = r.end()
+                if r[11]:
+                    event = 'file' if r[12] == b'\n' else 'unknown'
+                    name = rsync_decode(r[11])
+                    yield RsyncEvent(event, name=name, raw=r[0])
                 else:
-                    # yield returncode (int)
-                    yield int(data[(i + 1):(i + 4)])
-                    # remember any remaining data for next read1() cycle
-                    prev_data = data[(i + 26):]
-                    break
-            i += 1
-        # no possible msg found
+                    if r[7]:
+                        h, m, s = int(r[5]), int(r[6]), int(r[7])
+                    else:
+                        h, m, s = 0, int(r[5]), int(r[6])
+                    bps = (float(r[3]) * _UNITS.get(r[4], 1)) if r[3] else None
+                    yield RsyncEvent(
+                        'update',
+                        name=name,
+                        bytes_sent=int(r[1]),
+                        percent_complete=float(r[2]),
+                        bps=bps,
+                        eta=timedelta(hours=h, minutes=m, seconds=s),
+                        transfer_number=(int(r[8]) if r[8] else None),
+                        n_checked=(int(r[9]) if r[9] else None),
+                        n_total=(int(r[10]) if r[10] else None),
+                        raw=r[0]
+                    )
+            buff = [data[cursor:]] if cursor < len(data) else []
+    if buff:
+        name = rsync_decode(b''.join(buff))
+        yield RsyncEvent('unknown', name=name)
+
+
+def _rsync_decode(r: re.Match) -> bytes:
+    '''convert rsync escape match to a bytes character'''
+    return bytes([int(r[1], 8)])
+
+
+def rsync_decode(text: bytes) -> str:
+    '''decode rsync text with escapes'''
+    return _RE_RSYNC_ESCAPE.sub(_rsync_decode, text).decode(errors='replace')
+
+
+def rsync(
+    source_path: str | Iterable[str],
+    dest_path: str = '.',
+    arg: str = '-ac', *args: str,
+    verbose: bool = False,
+    callback: Callable[[RsyncEvent], None] = NOOP,
+    **opts: str | int | float | bool
+):
+    '''rsync files from `source_path` to `dest_path`
+
+    - `arg` and optionally additional `args` set `rsync` arguments like flags
+      - `--rsh`, `--verbose`, `--quiet`, and `--progress` may be ignored
+    - `verbose` prints the `rsync` command and shows `rsync`'s STDERR
+    - `callback` is called once for each update output from `rsync`
+    - `opts` keywords set `ssh_config` options, e.g. `port=22`
+    - raises a `CalledProcessError` if `rsync` fails
+    '''
+    src = [source_path] if isinstance(source_path, str) else list(source_path)
+    all_args = [arg, *args]
+    if opts:
+        all_args.append(f'-essh {_ssh_opt_args(opts)}')
+    cmd = 'rsync', *all_args, '-vq', '--progress', *src, (dest_path or '.')
+    if verbose:
+        sys.stdout.write(f'{_join(cmd)}\n')
+    stderr = None if verbose else STDOUT
+    with _Popen(cmd, stdin=DEVNULL, stdout=PIPE, stderr=stderr) as proc:
+        assert isinstance(proc.stdout, BufferedIOBase), 'rsync needs stdout'
+        for event in _rsync_events(proc.stdout):
+            callback(event)
+    if proc.returncode:
+        raise CalledProcessError(proc.returncode, cmd)
+
+
+def open(
+    host: str,
+    path: str,
+    mode: _MODE_STR = 'r',
+    *,
+    verbose: bool = False,
+    encoding: str = 'UTF-8',
+    errors='replace',
+    **opts: str | int | float | bool
+) -> TextIOWrapper | BufferedIOBase:
+    '''open a file-like object for a remote file over SSH
+
+    - any valid combination of read, write, append, text, and binary is allowed
+    - seeking and `+` modes are not allowed
+    - `opts` keywords set `ssh_config` options, e.g. `port=22`
+    - `verbose` sends and remote STDERR error output to the python STDOUT
+    '''
+    err = None if verbose else DEVNULL
+    if mode in {'r', 'rt', 'tr', 'rb', 'br'}:
+        cmd = ['ssh', *_ssh_opt_args(opts), host, f'cat {_quote(path)}']
+        if 'b' in mode:
+            proc = _Popen(cmd, stdin=DEVNULL, stdout=PIPE, stderr=err)
+            assert isinstance(proc.stdout, BufferedIOBase), \
+                'ssh subprocess stdout should be a BufferedIOBase'
+            return BinaryFile(proc, proc.stdout)
         else:
-            if capture:
-                # check for incomplete UTF-8 sequence
-                u = data[-3:].rjust(3)
-                # 1 of 2-char sequence
-                if u[2] & 0b11100000 == 0b11000000:
-                    prev_data = data[-1:]
-                    if n > 1:
-                        yield data[:-1]
-                # 2 of 3-char sequence
-                elif (
-                    u[1] & 0b11110000 == 0b11100000 and
-                    u[2] & 0b11000000 == 0b10000000
-                ):
-                    prev_data = data[-2:]
-                    if n > 2:
-                        yield data[:-2]
-                # 3 of 4-char sequence
-                elif (
-                    u[0] & 0b11111000 == 0b11110000 and
-                    u[1] & 0b11000000 == 0b10000000 and
-                    u[2] & 0b11000000 == 0b10000000
-                ):
-                    prev_data = data[-3:]
-                    if n > 3:
-                        yield data[:-3]
-                # no chance of breaking a valid UTF-8 sequence otherwise
-                else:
-                    yield data
-
-def _handle_output(data, text, tee, storage, encoding, errors):
-    '''selectively decode, write, and store data'''
-    if tee or storage is not None:
-        if text:
-            data = data.decode(encoding, errors)
-        if storage is not None:
-            storage.append(data)
-        if tee:
-            tee(data)
-
-def _join_output(capture, text, storage):
-    '''selectively join output together'''
-    return ('' if text else b'').join(storage) if capture else None
-
-def _quote(token: str) -> str:
-    '''quote a token for safe shell use, including newlines'''
-    if '\n' in token:
-        if not _SEARCH_UNSAFE(token):
-            return token.replace('\n', "$'\\n'")
-        token = token.replace("'", "'\"'\"'").replace('\n', "'$'\\n''")
-        return f"'{token}'"
-    elif not _SEARCH_UNSAFE(token):
-        return token or "''"
-    token = token.replace("'", "'\"'\"'")
-    return f"'{token}'"
+            proc = _Popen(
+                cmd, encoding=encoding, errors=errors,
+                stdin=DEVNULL, stdout=PIPE, stderr=err
+            )
+            assert isinstance(proc.stdout, TextIOWrapper), \
+                'ssh subprocess stdout should be a TextIOWrapper'
+            return TextFile(proc, proc.stdout)
+    if mode in {'w', 'wt', 'tw', 'wb', 'bw'}:
+        cmd = ['ssh', *_ssh_opt_args(opts), host, f'cat > {_quote(path)}']
+    elif mode in {'a', 'at', 'ta', 'ab', 'ba'}:
+        cmd = ['ssh', *_ssh_opt_args(opts), host, f'cat >> {_quote(path)}']
+    else:
+        raise ValueError('SSH file mode must be r, rb, w, wb, a, or ab')
+    if 'b' in mode:
+        proc = _Popen(cmd, stdin=PIPE, stdout=DEVNULL, stderr=err)
+        assert isinstance(proc.stdin, BufferedIOBase), \
+            'ssh subprocess stdout should be a BufferedIOBase'
+        return BinaryFile(proc, proc.stdin)
+    else:
+        proc = _Popen(
+            cmd, encoding=encoding, errors=errors,
+            stdin=PIPE, stdout=DEVNULL, stderr=err
+        )
+        assert isinstance(proc.stdin, TextIOWrapper), \
+            'ssh subprocess stdout should be a TextIOWrapper'
+        return TextFile(proc, proc.stdin)
 
 
-def _join(tokens: Iterable[str]) -> str:
-    '''convert verbatim argument list to safe command string'''
-    return ' '.join(map(_quote, tokens))
+def Popen(
+    host: str, cmd: Iterable[str] | str, *,
+    text: bool | None = None,
+    encoding: str | None = None,
+    errors: str | None = None,
+    stdin: int | IO | None = None,
+    stdout: int | IO | None = None,
+    stderr: int | IO | None = None,
+    bufsize: int = -1,
+    pipesize: int = -1,
+    cwd: str | None = None,
+    shell: bool = False,
+    **opts
+) -> _Popen:
+    '''start a command on the remote host, similar to `subprocess.Popen`
+
+    - `host` is the hostname and optionally username, e.g. `user@host`
+    - `opts` keywords set `ssh_config` options, e.g. `port=22`
+    - `cwd` changes the remote directory before execution
+    - other arguments work the same as for `subprocess.Popen`
+    '''
+    # reproduce eccentric way that subprocess handles cmd and shell
+    if shell:
+        if not isinstance(cmd, str):
+            cmd = next(iter(cmd))
+    else:
+        cmd = _quote(cmd) if isinstance(cmd, str) else _join(cmd)
+    # add cd for cwd
+    if cwd:
+        cmd = f'cd {_quote(cwd)} || exit $?; ' + cmd
+    # run the command
+    return _Popen(
+        ['ssh', host, *_ssh_opt_args(opts), '--', cmd],
+        text=text, encoding=encoding, errors=errors,
+        stdin=stdin, stdout=stdout, stderr=stderr,
+        bufsize=bufsize, pipesize=pipesize
+    )
 
 
 def run(
@@ -749,7 +1016,7 @@ def run(
         cmd = f'cd {_quote(cwd)} || exit $?; ' + cmd
     # run the command
     return _run(
-        ['ssh', host, *ssh_opt_args(opts), '--', cmd],
+        ['ssh', host, *_ssh_opt_args(opts), '--', cmd],
         check=check, text=text, encoding=encoding, errors=errors,
         stdin=stdin, stdout=stdout, stderr=stderr,
         input=input, capture_output=capture_output,
@@ -757,79 +1024,19 @@ def run(
     )
 
 
-def Popen(
-    host: str, cmd: Iterable[str] | str, *,
-    text: bool | None = None,
-    encoding: str | None = None,
-    errors: str | None = None,
-    stdin: int | IO | None = None,
-    stdout: int | IO | None = None,
-    stderr: int | IO | None = None,
-    bufsize: int = -1,
-    pipesize: int = -1,
-    cwd: str | None = None,
-    shell: bool = False,
-    **opts
-) -> _Popen:
-    '''start a command on the remote host, similar to `subprocess.Popen`
-
-    - `host` is the hostname and optionally username, e.g. `user@host`
-    - `opts` keywords set `ssh_config` options, e.g. `port=22`
-    - `cwd` changes the remote directory before execution
-    - other arguments work the same as for `subprocess.Popen`
-    '''
-    # reproduce eccentric way that subprocess handles cmd and shell
-    if shell:
-        if not isinstance(cmd, str):
-            cmd = next(iter(cmd))
-    else:
-        cmd = _quote(cmd) if isinstance(cmd, str) else _join(cmd)
-    # add cd for cwd
-    if cwd:
-        cmd = f'cd {_quote(cwd)} || exit $?; ' + cmd
-    # run the command
-    return _Popen(
-        ['ssh', host, *ssh_opt_args(opts), '--', cmd],
-        text=text, encoding=encoding, errors=errors,
-        stdin=stdin, stdout=stdout, stderr=stderr,
-        bufsize=bufsize, pipesize=pipesize
-    )
+def _write_flush_stdout(text: str) -> None:
+    '''write text to stdout, flush stdout'''
+    sys.stdout.write(text)
+    sys.stdout.flush()
 
 
-def rsync(
-    source_path: str | Iterable[str],
-    dest_path: str = '.',
-    arg: str = '-ac', *args: str,
-    verbose: bool = False,
-    callback: Callable[[RsyncEvent], None] = noop,
-    **opts: str | int | float | bool
-):
-    '''rsync files from `source_path` to `dest_path`
-
-    - `arg` and optionally additional `args` set `rsync` arguments like flags
-      - `--rsh`, `--verbose`, `--quiet`, and `--progress` may be ignored
-    - `verbose` prints the `rsync` command and shows `rsync`'s STDERR
-    - `callback` is called once for each update output from `rsync`
-    - `opts` keywords set `ssh_config` options, e.g. `port=22`
-    - raises a `CalledProcessError` if `rsync` fails
-    '''
-    src = [source_path] if isinstance(source_path, str) else list(source_path)
-    all_args = [arg, *args]
-    if opts:
-        all_args.append(f'-essh {ssh_opt_args(opts)}')
-    cmd = 'rsync', *all_args, '-vq', '--progress', *src, (dest_path or '.')
-    if verbose:
-        sys.stdout.write(f'{_join(cmd)}\n')
-    stderr = None if verbose else STDOUT
-    with _Popen(cmd, stdin=DEVNULL, stdout=PIPE, stderr=stderr) as proc:
-        assert isinstance(proc.stdout, BufferedIOBase), 'rsync needs stdout'
-        for event in rsync_events(proc.stdout):
-            callback(event)
-    if proc.returncode:
-        raise CalledProcessError(proc.returncode, cmd)
+def _write_flush_stdout_b(data: bytes) -> None:
+    '''write data to stdout, flush stdout'''
+    sys.stdout.buffer.write(data)
+    sys.stdout.flush()
 
 
-def ssh_opt_args(opts: dict[str, str | int | float | bool] = {}) -> list[str]:
+def _ssh_opt_args(opts: dict[str, str | int | float | bool] = {}) -> list[str]:
     '''convert `ssh_config` options to a list of `-o` arguments'''
     results = []
     for k, v in opts.items():
@@ -838,220 +1045,40 @@ def ssh_opt_args(opts: dict[str, str | int | float | bool] = {}) -> list[str]:
         results.append(f'-o{k} {v}')
     return results
 
-
-def open(
-    host: str,
-    path: str,
-    mode: MODE_STR = 'r',
-    *,
-    verbose: bool = False,
-    encoding: str = 'UTF-8',
-    errors='replace',
-    **opts: str | int | float | bool
-) -> TextIOWrapper | BufferedIOBase:
-    '''open a file-like object for a remote file over SSH
-
-    - any valid combination of read, write, append, text, and binary is allowed
-    - seeking and `+` modes are not allowed
-    - `opts` keywords set `ssh_config` options, e.g. `port=22`
-    - `verbose` sends and remote STDERR error output to the python STDOUT
-    '''
-    err = None if verbose else DEVNULL
-    if mode in {'r', 'rt', 'tr', 'rb', 'br'}:
-        cmd = ['ssh', *ssh_opt_args(opts), host, f'cat {_quote(path)}']
-        if 'b' in mode:
-            proc = _Popen(cmd, stdin=DEVNULL, stdout=PIPE, stderr=err)
-            assert isinstance(proc.stdout, BufferedIOBase), \
-                'ssh subprocess stdout should be a BufferedIOBase'
-            return BinaryFile(proc, proc.stdout)
-        else:
-            proc = _Popen(
-                cmd, encoding=encoding, errors=errors,
-                stdin=DEVNULL, stdout=PIPE, stderr=err
-            )
-            assert isinstance(proc.stdout, TextIOWrapper), \
-                'ssh subprocess stdout should be a TextIOWrapper'
-            return TextFile(proc, proc.stdout)
-    if mode in {'w', 'wt', 'tw', 'wb', 'bw'}:
-        cmd = ['ssh', *ssh_opt_args(opts), host, f'cat > {_quote(path)}']
-    elif mode in {'a', 'at', 'ta', 'ab', 'ba'}:
-        cmd = ['ssh', *ssh_opt_args(opts), host, f'cat >> {_quote(path)}']
-    else:
-        raise ValueError('SSH file mode must be r, rb, w, wb, a, or ab')
-    if 'b' in mode:
-        proc = _Popen(cmd, stdin=PIPE, stdout=DEVNULL, stderr=err)
-        assert isinstance(proc.stdin, BufferedIOBase), \
-            'ssh subprocess stdout should be a BufferedIOBase'
-        return BinaryFile(proc, proc.stdin)
-    else:
-        proc = _Popen(
-            cmd, encoding=encoding, errors=errors,
-            stdin=PIPE, stdout=DEVNULL, stderr=err
-        )
-        assert isinstance(proc.stdin, TextIOWrapper), \
-            'ssh subprocess stdout should be a TextIOWrapper'
-        return TextFile(proc, proc.stdin)
+def _quote(token: str) -> str:
+    '''quote a token for safe shell use, including newlines'''
+    if '\n' in token:
+        if not _SEARCH_UNSAFE(token):
+            return token.replace('\n', "$'\\n'")
+        token = token.replace("'", "'\"'\"'").replace('\n', "'$'\\n''")
+        return f"'{token}'"
+    elif not _SEARCH_UNSAFE(token):
+        return token or "''"
+    token = token.replace("'", "'\"'\"'")
+    return f"'{token}'"
 
 
-def _close_ssh_file(proc: _Popen, file: BufferedIOBase | TextIOWrapper):
-    '''close an ssh file and wait on the parent process'''
-    file.close()
-    if returncode := proc.wait():
-        raise CalledProcessError(returncode, proc.args)
+def _join(tokens: Iterable[str]) -> str:
+    '''convert verbatim argument list to safe command string'''
+    return ' '.join(map(_quote, tokens))
 
 
-class TextFile(TextIOWrapper):
-    '''text file opened over SSH'''
-
-    def __init__(self, proc: _Popen, file: TextIOWrapper):
-        self.proc = proc
-        self.file = file
-        # use weakref so that open(..).write(...) immediately flushes & closes
-        self._finalize = weakref.finalize(
-            self, _close_ssh_file, self.proc, self.file
-        )
-
-    def remove(self):
-        self._finalize()
-
-    @property
-    def removed(self) -> bool:
-        return not self._finalize.alive
-
-    def close(self):
-        _close_ssh_file(self.proc, self.file)    
-
-    @property
-    def closed(self) -> bool:
-        return self.file.closed
-
-    def fileno(self) -> int:
-        return self.file.fileno()
-
-    def flush(self):
-        self.file.flush()
-
-    @property
-    def encoding(self) -> str:
-        return self.file.encoding
-
-    @property
-    def errors(self) -> str | None:
-        return self.file.errors
-
-    @property
-    def newlines(self) -> str | tuple[str, ...] | None:
-        return self.file.newlines
-
-    def isatty(self) -> bool:
-        return False
-
-    def seekable(self) -> bool:
-        return False
-
-    def tell(self) -> int:
-        return self.file.tell()
-
-    def readable(self) -> bool:
-        return self.file.readable()
-
-    def read(self, size=-1) -> str:
-        return self.file.read(size)
-
-    def readline(self, size=-1) -> str:
-        return self.file.readline(size)
-
-    def readlines(self, hint: int = -1) -> list[str]:
-        return self.file.readlines(hint)
-
-    def writable(self) -> bool:
-        return self.file.writable()
-
-    def write(self, text: str) -> int:
-        return self.file.write(text)
-
-    def __next__(self) -> str:
-        if line := self.file.readline():
-            return line
-        raise StopIteration
-
-    def __repr__(self) -> str:
-        name = self.__class__.__name__
-        return  f'{name}(proc={self.proc!r}, file={self.file!r})'
+def __dir__() -> tuple[str, ...]:
+    '''define items exported for use outside, e.g. for tab-completion'''
+    return _EXPORTS
 
 
-class BinaryFile(BufferedIOBase):
-    '''binary file opened over SSH'''
-
-    def __init__(self, proc: _Popen, file: BufferedIOBase):
-        self.proc = proc
-        self.file = file
-        # use weakref so that open(..).write(...) immediately flushes & closes
-        self._finalize = weakref.finalize(
-            self, _close_ssh_file, self.proc, self.file
-        )
-
-    def remove(self):
-        self._finalize()
-
-    @property
-    def removed(self) -> bool:
-        return not self._finalize.alive
-
-    def close(self):
-        _close_ssh_file(self.proc, self.file)    
-
-    @property
-    def closed(self) -> bool:
-        return self.file.closed
-
-    def fileno(self) -> int:
-        return self.file.fileno()
-
-    def flush(self):
-        self.file.flush()
-
-    def isatty(self) -> bool:
-        return False
-
-    def seekable(self) -> bool:
-        return False
-
-    def tell(self) -> int:
-        return self.file.tell()
-
-    def readable(self) -> bool:
-        return self.file.readable()
-
-    def read(self, size=-1) -> bytes:
-        return self.file.read(size)
-
-    def read1(self, size: int = -1) -> bytes:
-        return self.file.read1(size)
-
-    def readinto(self, buffer: bytearray | memoryview) -> int:
-        return self.file.readinto(buffer)
-
-    def readinto1(self, buffer: bytearray | memoryview) -> int:
-        return super().readinto1(buffer)
-
-    def readline(self, size=-1) -> bytes:
-        return self.file.readline(size)
-
-    def readlines(self, hint: int = -1) -> list[bytes]:
-        return self.file.readlines(hint)
-
-    def writable(self) -> bool:
-        return self.file.writable()
-
-    def write(self, data: bytes) -> int:
-        return self.file.write(data)
-
-    def __next__(self) -> bytes:
-        if line := self.file.readline():
-            return line
-        raise StopIteration
-
-    def __repr__(self) -> str:
-        name = self.__class__.__name__
-        return  f'{name}(proc={self.proc!r}, file={self.file!r})'
+_EXPORTS = tuple(export.__name__ for export in (
+    Host,
+    Shell,
+    open,
+    TextFile,
+    BinaryFile,
+    PrematureExit,
+    rsync,
+    rsync_decode,
+    RsyncEvent,
+    run,
+    Popen,
+    NOOP,
+))
