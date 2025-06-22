@@ -3,7 +3,7 @@
 '''Manage jobs across multiple processes and hosts'''
 
 from collections.abc import Callable, Generator, Iterable, Iterator
-from collections.abc import MutableMapping
+from collections.abc import Mapping, MutableMapping
 from datetime import timedelta
 from io import BytesIO, BufferedIOBase, TextIOWrapper, IOBase
 from random import choices
@@ -12,7 +12,7 @@ from subprocess import CompletedProcess, CalledProcessError
 from subprocess import DEVNULL, PIPE, STDOUT, TimeoutExpired
 from subprocess import Popen as _Popen, run as _run
 import sys
-from typing import Literal, IO, Any
+from typing import ItemsView, KeysView, Literal, IO, Any
 import weakref
 
 _DIGITS = frozenset(b'0123456789')
@@ -562,17 +562,19 @@ class Shell(MutableMapping):
           (may become dynamic in a later release)
         '''
 
+        self._shopts: ShellOptions = ShellOptions(self)
         self._host: str | Host = host
         self._data: bytes = b''
-        self._pwd: str | None = None
-        self._env: dict[str, str] | None = None
         self._id: bytes = b''
         self._proc: _Popen | None = None
+        self._cache: dict = {}
 
     def connect(self):
         '''connect to the shell with a call to `ssh`'''
         if self._proc:
             raise CalledProcessError(1, 'ssh', 'shell already connected')
+        self._cache.clear()
+        self._data = b''
         # make command loop
         self._id: bytes = bytes(choices(_ID_CHARS, k=22))
         id = self._id.decode('utf-8')
@@ -599,18 +601,19 @@ class Shell(MutableMapping):
                 cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT
             )
         # test new connection to ensure that everything is working
-        out = self('printf "%s" "$0"', check=True, text=True, tee=False).stdout
+        out = self._soft_call('printf "%s" "$0"')
         self.shell = out.rpartition('/')[2].lstrip('-')
         self.shell_version = ''
         if _IS_VALID_ENV_VAR_NAME(self.shell):
             cmd = f'printf "%s" "${{{self.shell.upper()}_VERSION}}"'
-            v = self(cmd, check=True, text=True, tee=False).stdout
-            self.shell_version = v
+            self.shell_version = self._soft_call(cmd)
 
 
     def close(self, timeout: int | float = 10):
         '''exit the shell, SIGTERM until `timeout`, then KILL if needed'''
         if self._proc:
+            self._cache.clear()
+            self._data = b''
             self._proc.terminate()
             try:
                 self._proc.wait(timeout)
@@ -675,8 +678,8 @@ class Shell(MutableMapping):
         # convert command to shell token string
         if not isinstance(cmd, str):
             cmd = ' '.join(map(_quote, cmd))
-        # clear cached environment and pwd
-        self._env = self._pwd = None
+        # clear cached values
+        self._cache.clear()
         # send the command to remote shell loop
         self._proc.stdin.write(f'{cmd}\0'.encode('utf-8'))
         self._proc.stdin.flush()
@@ -774,6 +777,15 @@ class Shell(MutableMapping):
                     else:
                         yield data
 
+    def _soft_call(self, cmd: Iterable[str] | str) -> str:
+        '''same as __call__ but with some defaults and saving the cache'''
+        saved_cache = self._cache
+        output = self(
+            cmd, check=True, tee=False, capture=True,
+            text=True, encoding='UTF-8', errors='replace'
+        ).stdout
+        self._cache = saved_cache
+        return output
 
     def source(
         self,
@@ -812,22 +824,19 @@ class Shell(MutableMapping):
         else:
             # a find without cd-ing works for the current (.) directory
             cmd = '\\find . -maxdepth 1 -print0'
-        # run the command
-        output = self(cmd, check=True, text=True, tee=False).stdout
-        # convert to sorted tuple, and cut off leading ./ from find
+        # run cmd and convert to sorted tuple, and cut off leading ./ from find
         return tuple(sorted({
             name[2:] if name[:2] == './' else name
-            for name in output.split('\0') if name not in '..'
+            for name in self._soft_call(cmd).split('\0') if name not in '..'
         }))
 
     def cd(self, path: str = '') -> str:
         '''change remote present working directory, returns the new `pwd`'''
         cmd = f'\\cd {_quote(path)} && \\pwd' if path else '\\cd && \\pwd'
-        out: str = self(cmd, check=True, text=True, tee=False).stdout
-        if not out.endswith('\n'):
+        if not (out := self._soft_call(cmd)).endswith('\n'):
             raise ValueError
-        self._pwd = out[:-1]
-        return self._pwd
+        pwd = self._cache['pwd'] = out[:-1]
+        return pwd
 
     @property
     def pwd(self) -> str:
@@ -835,12 +844,13 @@ class Shell(MutableMapping):
 
         - setting `pwd` is equivalent to `cd(pwd, expand=False)`
         '''
-        if self._pwd is None:
-            out: str = self('\\pwd', check=True, text=True, tee=False).stdout
-            if not out.endswith('\n'):
+        try:
+            return self._cache['pwd']
+        except KeyError:
+            if not (out := self._soft_call('\\pwd')).endswith('\n'):
                 raise ValueError('invalid pwd output')
-            self._pwd = out[:-1]
-        return self._pwd
+            pwd = self._cache['pwd'] = out[:-1]
+            return pwd
     @pwd.setter
     def pwd(self, path: str):
         self.cd(path)
@@ -856,17 +866,21 @@ class Shell(MutableMapping):
     def path(self, path: str | tuple[str, ...]):
         self['PATH'] = ':'.join([path] if isinstance(path, str) else path)
 
+    @property
+    def shopts(self) -> 'ShellOptions':
+        '''the `set -o` and `shopt` options for the shell'''
+        return self._shopts
+
     def _get_env(self) -> dict[str, str]:
         '''unsafe env access'''
-        if self._env is None:
-            self._env = {
-                k: v for k, _, v in (
-                    line.partition('=') for line in self(
-                        '\\env -0', check=True, text=True, tee=False
-                    ).stdout.split('\0') if line
-                )
-            }
-        return self._env
+        try:
+            return self._cache['env']
+        except KeyError:
+            env = self._cache['env'] = {k: v for k, _, v in (
+                line.partition('=')
+                for line in self._soft_call('\\env -0').split('\0') if line
+            )}
+            return env
 
     def __setitem__(self, key: str, value: str):
         # ensure valid key and value
@@ -880,23 +894,21 @@ class Shell(MutableMapping):
             else:
                 raise ValueError(f'invalid environment value: {value!r}')
         # set on remote shell
-        self(['export', f'{key}={value}'], check=True, tee=False)
+        self._soft_call(['export', f'{key}={value}'])
         # set in local cache
-        if self._env is not None:
-            self._env[key] = value
+        self._cache.get('env', {})[key] = value
 
     def __delitem__(self, key: str):
         # ensure valid key
         if not _IS_VALID_ENV_VAR_NAME(key):
             raise ValueError(f'invalid environment variable name: {key}')
         # set on remote shell
-        self(f'unset {key}', check=True, tee=False)
+        self._soft_call(['unset', key])
         # set in local cache
-        if self._env is not None:
-            try:
-                del self._env[key]
-            except KeyError:
-                pass
+        try:
+            del self._cache['env'][key]
+        except KeyError:
+            pass
 
     def __len__(self) -> int:
         '''environment variable count'''
@@ -920,6 +932,61 @@ class Shell(MutableMapping):
         return self._get_env() == other
     def __ne__(self, other):
         return self._get_env() != other
+
+
+class ShellOptions(MutableMapping):
+    '''expose and write to shell options with `shopt` and `set -o`'''
+    def __init__(self, shell: Shell) -> None:
+        self._shell_ref = weakref.ref(shell)
+    def _get_opts(self) -> dict[str, bool]:
+        # ensure shell is still around, and dereference it for use in this func
+        if (shell := self._shell_ref()) is None:
+            raise ValueError('shell no longer active')
+        # try just returning from the shell's cache
+        try:
+            return shell._cache['opts']
+        except KeyError:
+            # since cache wasn't there, ask the remote shell instead
+            opts = {}
+            out = shell._soft_call(r'\shopt 2>/dev/null; \set -o 2>/dev/null')
+            # parse the `shopt` and `set -o` output lines
+            for line in out.splitlines():
+                if len(tokens := line.split()) == 2:
+                    if tokens[1] in ('on', 'off'):
+                        opts[tokens[0]] = tokens[1] == 'on'
+            shell._cache['opts'] = opts
+            return opts
+    def __contains__(self, key: str) -> bool:
+        return key in self._get_opts()
+    def __delitem__(self, key: str) -> None:
+        raise NotImplementedError('shell options cannot be removed')
+    def __getitem__(self, key: str) -> bool:
+        return self._get_opts()[key]
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._get_opts())
+    def __len__(self) -> int:
+        return len(self._get_opts())
+    def __setitem__(self, key: str, value: bool) -> None:
+        # ensure shell is still around, and dereference it for use in this func
+        if (shell := self._shell_ref()) is None:
+            raise ValueError('shell no longer active')
+        # convert value to bool/set/shopt args
+        value = bool(value)
+        set_sign = '-' if value else '+'
+        shopt_arg = '-s' if value else '-u'
+        # compose and call the cmd to set option
+        cmd = f'set {set_sign}o {_quote(key)} 2>/dev/null'
+        cmd += f' || shopt {shopt_arg} {_quote(key)}'
+        shell._soft_call(cmd)
+        # remember in the cache
+        if (opts := shell._cache.get('opts')) is not None:
+            opts[key] = value
+    def items(self) -> ItemsView[str, bool]:
+        return self._get_opts().items()
+    def keys(self) -> KeysView:
+        return self._get_opts().keys()
+    def values(self) -> Iterable[bool]:
+        return self._get_opts().values()
 
 
 def _rsync_events(file: BufferedIOBase | bytes) -> Generator[RsyncEvent]:
