@@ -248,8 +248,7 @@ class Host:
 
     def open(
         self, path: str, mode: _MODE_STR = 'r', *,
-        encoding: str = 'UTF-8', errors='replace',
-        verbose: bool = False, **opts: str | int | float | bool,
+        encoding: str = 'UTF-8', errors='replace', verbose: bool = False
     ) -> TextIOWrapper | BufferedIOBase:
         '''open a file-like object for a remote file over SSH
 
@@ -276,7 +275,6 @@ class Host:
         pipesize: int = -1,
         cwd: str | None = None,
         shell: bool = False,
-        **opts
     ) -> _Popen:
         '''start a command on the remote host, similar to `subprocess.Popen`
 
@@ -1081,7 +1079,7 @@ def rsync(
 
 
 def open(
-    host: str,
+    host: str | Host,
     path: str,
     mode: _MODE_STR = 'r',
     *,
@@ -1097,14 +1095,22 @@ def open(
     - `opts` keywords set `ssh_config` options, e.g. `port=22`
     - `verbose` sends and remote STDERR error output to the python STDOUT
     '''
+    # dereference host info
+    if isinstance(host, Host):
+        host, host_opts = host.host, host.opts
+        opts = _MULTIPLEX_OPTS | host_opts | opts
+    # decide error output
     err = None if verbose else DEVNULL
+    # read-only
     if mode in {'r', 'rt', 'tr', 'rb', 'br'}:
         cmd = ['ssh', *_ssh_opt_args(opts), host, f'cat {_quote(path)}']
+        # read-only binary
         if 'b' in mode:
             proc = _Popen(cmd, stdin=DEVNULL, stdout=PIPE, stderr=err)
             assert isinstance(proc.stdout, BufferedIOBase), \
                 'ssh subprocess stdout should be a BufferedIOBase'
             return BinaryFile(proc, proc.stdout)
+        # read-only text
         else:
             proc = _Popen(
                 cmd, encoding=encoding, errors=errors,
@@ -1113,17 +1119,22 @@ def open(
             assert isinstance(proc.stdout, TextIOWrapper), \
                 'ssh subprocess stdout should be a TextIOWrapper'
             return TextFile(proc, proc.stdout)
+    # write-only file command
     if mode in {'w', 'wt', 'tw', 'wb', 'bw'}:
         cmd = ['ssh', *_ssh_opt_args(opts), host, f'cat > {_quote(path)}']
+    # append-only file command
     elif mode in {'a', 'at', 'ta', 'ab', 'ba'}:
         cmd = ['ssh', *_ssh_opt_args(opts), host, f'cat >> {_quote(path)}']
+    # unknown file mode
     else:
         raise ValueError('SSH file mode must be r, rb, w, wb, a, or ab')
+    # open binary write/append file
     if 'b' in mode:
         proc = _Popen(cmd, stdin=PIPE, stdout=DEVNULL, stderr=err)
         assert isinstance(proc.stdin, BufferedIOBase), \
             'ssh subprocess stdout should be a BufferedIOBase'
         return BinaryFile(proc, proc.stdin)
+    # open text write/append file
     else:
         proc = _Popen(
             cmd, encoding=encoding, errors=errors,
@@ -1148,7 +1159,7 @@ def Popen(
     pipesize: int = -1,
     cwd: str | None = None,
     shell: bool = False,
-    **opts
+    **opts: str | int | float | bool
 ) -> _Popen:
     '''start a command on the remote host, similar to `subprocess.Popen`
 
@@ -1196,7 +1207,7 @@ def run(
     pipesize: int = -1,
     cwd: str | None = None,
     shell: bool = False,
-    **opts
+    **opts: str | int | float | bool
 ) -> CompletedProcess:
     '''run a command on the remote host, similar to `subprocess.run`
 
