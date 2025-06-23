@@ -15,6 +15,8 @@ import sys
 from typing import ItemsView, KeysView, Literal, IO, Any
 import weakref
 
+# TODO [Host.]open() should raise FileNotFoundError and other OSError
+
 _DIGITS = frozenset(b'0123456789')
 _ID_CHARS = b'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz@_'
 _IS_VALID_ENV_VAR_NAME = re.compile(r'[a-zA-Z_][a-zA-Z0-9_]*$').match
@@ -54,7 +56,8 @@ _UNITS = {
 _SEARCH_UNSAFE = re.compile(r'[^\w@%+=:,./\n-]', re.ASCII).search
 
 
-def NOOP(*args, **kwargs) -> None: '"no operation" function that does nothing'
+def NOOP(*args, **kwargs) -> None:
+    '"no operation" function that does nothing'
 
 
 class RsyncEvent:
@@ -201,6 +204,9 @@ class Host:
             self._proc.terminate()
             self._proc.wait()
             self._proc = None
+
+    # alias for shell terminology
+    exit = disconnect
 
     def rsync_upload(
         self,
@@ -609,7 +615,7 @@ class Shell(MutableMapping):
             self.shell_version = self._soft_call(cmd)
 
 
-    def close(self, timeout: int | float = 10):
+    def disconnect(self, timeout: int | float = 10):
         '''exit the shell, SIGTERM until `timeout`, then KILL if needed'''
         if self._proc:
             self._cache.clear()
@@ -623,7 +629,7 @@ class Shell(MutableMapping):
             self._proc = None
 
     # alias for shell terminology
-    exit = close
+    exit = disconnect
 
     @property
     def closed(self) -> bool:
@@ -634,7 +640,7 @@ class Shell(MutableMapping):
         return self
 
     def __exit__(self, exc_type=None, exc_value=None, traceback=None):
-        self.close()
+        self.disconnect()
 
     def __call__(
         self,
@@ -1168,7 +1174,9 @@ def Popen(
 
 
 def run(
-    host: str, cmd: Iterable[str] | str, *,
+    host: str | Host,
+    cmd: Iterable[str] | str,
+    *,
     check: bool = False,
     text: bool | None = None,
     encoding: str | None = None,
@@ -1200,6 +1208,10 @@ def run(
     # add cd for cwd
     if cwd:
         cmd = f'cd {_quote(cwd)} || exit $?; ' + cmd
+    # dereference host info
+    if isinstance(host, Host):
+        host, host_opts = host.host, host.opts
+        opts = _MULTIPLEX_OPTS | host_opts | opts
     # run the command
     return _run(
         ['ssh', host, *_ssh_opt_args(opts), '--', cmd],
