@@ -1135,7 +1135,9 @@ def open(
 
 
 def Popen(
-    host: str, cmd: Iterable[str] | str, *,
+    host: str | Host,
+    cmd: Iterable[str] | str,
+    *,
     text: bool | None = None,
     encoding: str | None = None,
     errors: str | None = None,
@@ -1164,6 +1166,10 @@ def Popen(
     # add cd for cwd
     if cwd:
         cmd = f'cd {_quote(cwd)} || exit $?; ' + cmd
+    # dereference host info
+    if isinstance(host, Host):
+        host, host_opts = host.host, host.opts
+        opts = _MULTIPLEX_OPTS | host_opts | opts
     # run the command
     return _Popen(
         ['ssh', host, *_ssh_opt_args(opts), '--', cmd],
