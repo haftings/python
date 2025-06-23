@@ -2,17 +2,18 @@
 
 '''Manage jobs across multiple processes and hosts'''
 
-from collections.abc import Callable, Generator, Iterable, Iterator
-from collections.abc import Mapping, MutableMapping
-from datetime import timedelta
-from io import BytesIO, BufferedIOBase, TextIOWrapper, IOBase
-from random import choices
-import re
+
 from subprocess import CompletedProcess, CalledProcessError
 from subprocess import DEVNULL, PIPE, STDOUT, TimeoutExpired
 from subprocess import Popen as _Popen, run as _run
-import sys
+from io import BytesIO, BufferedIOBase, TextIOWrapper, IOBase
 from typing import ItemsView, KeysView, Literal, IO, Any
+from collections.abc import Callable, Generator, Iterable, Iterator
+from collections.abc import MutableMapping
+import datetime
+import random
+import re
+import sys
 import weakref
 
 # TODO [Host.]open() should raise FileNotFoundError and other OSError
@@ -70,7 +71,7 @@ class RsyncEvent:
         bytes_sent: int | None = None,
         percent_complete: float | None = None,
         bps: float | None = None,
-        eta: timedelta | None = None,
+        eta: datetime.timedelta | None = None,
         transfer_number: int | None = None,
         n_checked: int | None = None,
         n_total: int | None = None,
@@ -580,7 +581,7 @@ class Shell(MutableMapping):
         self._cache.clear()
         self._data = b''
         # make command loop
-        self._id: bytes = bytes(choices(_ID_CHARS, k=22))
+        self._id: bytes = bytes(random.choices(_ID_CHARS, k=22))
         id = self._id.decode('utf-8')
         cmd = (
             # trap exit signals
@@ -1023,7 +1024,7 @@ def _rsync_events(file: BufferedIOBase | bytes) -> Generator[RsyncEvent]:
                         bytes_sent=int(r[1]),
                         percent_complete=float(r[2]),
                         bps=bps,
-                        eta=timedelta(hours=h, minutes=m, seconds=s),
+                        eta=datetime.timedelta(hours=h, minutes=m, seconds=s),
                         transfer_number=(int(r[8]) if r[8] else None),
                         n_checked=(int(r[9]) if r[9] else None),
                         n_total=(int(r[10]) if r[10] else None),
