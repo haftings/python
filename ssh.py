@@ -5,34 +5,60 @@
 
 from subprocess import CompletedProcess, CalledProcessError
 from subprocess import DEVNULL, PIPE, STDOUT, TimeoutExpired
-from subprocess import Popen as _Popen, run as _run
-from io import BytesIO, BufferedIOBase, TextIOWrapper, IOBase
-from typing import ItemsView, KeysView, Literal, IO, Any
+from subprocess import run as _run, Popen as _Popen
+from io import BytesIO, BufferedIOBase, BufferedReader, TextIOWrapper, IOBase
+from typing import cast, Any, IO, ItemsView, KeysView, Literal
 from collections.abc import Callable, Generator, Iterable, Iterator
 from collections.abc import MutableMapping
 import datetime
+import os
 import random
 import re
 import sys
 import weakref
 
-# TODO [Host.]open() should raise FileNotFoundError and other OSError
+# TODO csh / tcsh environment variable parsing and `Shell` support
 
 _DIGITS = frozenset(b'0123456789')
+'''decimal digits `[0-9]`'''
+
 _ID_CHARS = b'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz@_'
+'''characters used for IDs, `[A-Z0-9a-z@_]`'''
+
 _IS_VALID_ENV_VAR_NAME = re.compile(r'[a-zA-Z_][a-zA-Z0-9_]*$').match
+'''highly restrictive test for a valid environment variable name'''
+
+_ERRNO_STR = (
+    (1, 'operation not permitted'),
+    (2, 'no such file'), # omit ' or directory' suffix for dash
+    (3, 'no such process'),
+    (4, 'interrupted system call'),
+    (10, 'no child processes'),
+    (13, 'permission denied'),
+    (17, 'file exists'),
+    (20, 'not a directory'),
+    (21, 'is a directory'),
+    (32, 'broken pipe'),
+)
+'''sequence of `(errno, strerror)` pairs to look for in `stderr`'''
+
 _MODE_STR = Literal[
     'r', 'rt', 'tr', 'rb', 'br',
-    'w', 'wt', 'tw', 'wb', 'bw',
-    'a', 'at', 'ta', 'ab', 'ba'
+    'w', 'wt', 'tw', 'wb', 'bw', 'a', 'at', 'ta', 'ab', 'ba'
 ]
+'''allowed modes such as `r`, `wb`, etc.'''
+
 _MULTIPLEX_OPTS: dict[str, str] = {
     'loglevel': 'error',
     'controlmaster': 'auto',
     'controlpath': '~/.ssh/.%u@%h:%p.control',
     'controlpersist': 'no'
 }
+'''options required for multiplexing'''
+
 _RE_RSYNC_ESCAPE = re.compile(rb'\\#([0-7][0-7][0-7])')
+'''matches an rsync escape code'''
+
 _RE_RSYNC = re.compile(rb'''
     # file_name\n
     #       52461568  50%   19.53MB/s   00:00:02\r
@@ -50,11 +76,50 @@ _RE_RSYNC = re.compile(rb'''
     )
     | ( [^\r\n]* ) ([\r\n])  # generic line (possibly file name)
 ''', re.X)
+'''parses rsync output line ending in `\r` or `\n`'''
+
 _UNITS = {
     b'K': 1024, b'M': 1024 ** 2, b'G': 1024 ** 3, b'T': 1024 ** 4,
     b'P': 1024 ** 5, b'E': 1024 ** 6, b'Z': 1024 ** 7, b'Y': 1024 ** 8
 }
-_SEARCH_UNSAFE = re.compile(r'[^\w@%+=:,./\n-]', re.ASCII).search
+'''units used by rsync'''
+
+_NO_QUOTE_NEEDED = re.compile(r'^[\w./-]+$').match
+'''matches for str with only shell-legal unquoted token chars'''
+
+_SINGLE_QUOTABLE = re.compile(r'^[^\n\r\']*$').match
+'''matches for str without `'` or newlines'''
+
+_DOUBLE_QUOTABLE = re.compile(r"^[\w\t\ #&()*+,./:;<=>?@\[\]^_|~'-]*$").match
+'''matches for str without chars with special meaning inside `""`'''
+
+_DITHER_QUOTABLE = re.compile(r'^[^\n\r]*$').match
+'''matches for str expressible with a combo of `''` and `""`'''
+
+_RE_DITHER_QUOTE = re.compile(r'''
+    (?:
+        # single quotes
+        ([^\\'"]*?[^\w\t\ #&()*+,./:;<=>?@\[\]^_|~'-][^']*)
+    |
+        # double quotes are much more complicated
+        [\w\t\ #&()*+,./:;<=>?@\[\]^_|~-]*'['\w\t\ #&()*+,./:;<=>?@\[\]^_|~-]*
+    )
+''', re.X)
+'''match a single sequence of ''-quotable or ""-quotable chars'''
+
+_SUB_PRINTF_ESC = re.compile(r'''[^\w\t\ #&()*+,./:;<=>?@\[\]^_|~-]''').sub
+'''`re.sub` function for chars that need quoting in quoted `printf` style'''
+
+
+def _stderr2oserror(stderr: str, name: str | None = None) -> OSError:
+    '''convert common stderr text to errno, return 255 if unrecognized'''
+    if name:
+        stderr = stderr.replace(name, ' ', 1)
+    stderr = ' '.join(stderr[-128:].split()).lower()
+    for errno, msg in _ERRNO_STR:
+        if msg in stderr:
+            return OSError(errno, os.strerror(errno), name or None)
+    return OSError(255, 'Unknown error', name or None)
 
 
 def NOOP(*args, **kwargs) -> None:
@@ -193,8 +258,8 @@ class Host:
                 cmd, stderr=DEVNULL, stdout=PIPE, stdin=DEVNULL
             )
             # read the single newline from stdout to ensure multiplex is set up
-            assert isinstance(self._proc.stdout, BufferedIOBase)
-            if (ack := self._proc.stdout.read(1)) != b'\n':
+            ack = cast(BufferedIOBase, self._proc.stdout).read(1)
+            if ack != b'\n':
                 self._proc.terminate()
                 self._proc.wait()
                 self._proc = None
@@ -322,51 +387,148 @@ class Host:
 class TextFile(TextIOWrapper):
     '''text file opened over SSH'''
 
-    def __init__(self, proc: _Popen, file: TextIOWrapper):
-        self.proc = proc
-        self.file = file
-        # use weakref so that open(..).write(...) immediately flushes & closes
-        self._finalize = weakref.finalize(
-            self, self._close, self.file, self.proc, CalledProcessError
-        )
+    def __init__(
+        self, host: str | Host, path: str, mode: _MODE_STR = 'r',
+        encoding: str = 'UTF-8', errors='replace',
+        **opts: str | int | float | bool
+    ):
+        # no binary allowed
+        if 'b' in mode:
+            raise ValueError('TextFile cannot be opened in binary mode')
+        # store arguments
+        if isinstance(host, Host):
+            self._host, host_opts = host.host, host.opts
+            self._opts = _MULTIPLEX_OPTS | host_opts | opts
+        else:
+            self._host = host
+            self._opts = dict(opts)
+        self._path = path
+        self._mode = mode
+        self._encoding = encoding
+        self._errors = errors
+        self._proc = None
+        # open the connection and file
+        self.open()
 
-    @staticmethod
-    def _close(file: TextIOWrapper, proc: _Popen, CalledProcessError: type):
-        file.close()
-        if returncode := proc.wait():
-            raise CalledProcessError(returncode, proc.args)
-
-    def remove(self):
-        self._finalize()
-
-    @property
-    def removed(self) -> bool:
-        return not self._finalize.alive
+    def open(self) -> 'TextFile':
+        if self._proc:
+            return self
+        args = _ssh_opt_args(self._opts)
+        # this ID is used to ensure stderr has actually finished transmitting
+        id_b = bytes(random.choices(_ID_CHARS, k=22))
+        id = id_b.decode()
+        # set up & run a `cat` command such that:
+        # - avoid acknowledgement on file error: `(...)<file`:
+        # - csh/tcsh compatibility: `> /dev/stderr` instead of `>&2`
+        # - csh/tcsh compatibility: `()` instead of `{}`
+        # - prevent aliasing: `\` prefixes for `echo` and `cat`
+        # - spaces between certain tokens for compatibility w/ some shells
+        # read mode
+        if self._mode in {'r', 'rt', 'tr'}:
+            cmd = ['ssh', *args, self._host, '--', (
+                rf'( \echo {id} > /dev/stderr; \cat; ) < {quote(self._path)}'
+                rf' || \echo error {id} > /dev/stderr'
+            )]
+            self._proc = _Popen(
+                cmd, stdin=DEVNULL, stdout=PIPE, stderr=PIPE,
+                encoding=self._encoding, errors=self._errors
+            )
+        # write mode
+        elif self._mode in {'w', 'wt', 'tw'}:
+            cmd = ['ssh', *args, self._host, '--', (
+                rf'( \echo {id} > /dev/stderr; \cat; ) > {quote(self._path)}'
+                rf' || \echo error {id} > /dev/stderr'
+            )]
+            self._proc = _Popen(
+                cmd, stdin=PIPE, stdout=DEVNULL, stderr=PIPE,
+                encoding=self._encoding, errors=self._errors
+            )
+        # append mode
+        elif self._mode in {'a', 'at', 'ta'}:
+            cmd = ['ssh', *args, self._host, '--', (
+                rf'( \echo {id} > /dev/stderr; \cat; ) >> {quote(self._path)}'
+                rf' || \echo error {id} > /dev/stderr'
+            )]
+            self._proc = _Popen(
+                cmd, stdin=PIPE, stdout=DEVNULL, stderr=PIPE,
+                encoding=self._encoding, errors=self._errors
+            )
+        # unknown file mode
+        else:
+            raise ValueError('SSH text file mode must be r, w, or a')
+        # read stderr until id is found
+        stderr = b''
+        while id_b not in stderr:
+            # read the next readable block of bytes from the stderr buffer
+            stderr_fd = cast(TextIOWrapper, self._proc.stderr)
+            if data := cast(BufferedReader, stderr_fd.buffer).read1():
+                stderr += data
+            # EOF before id?
+            else:
+                self.close()
+                msg = 'Unexpected stderr from ssh'
+                raise OSError(32, msg, f'{self._host}:{self._path}')
+        # other stderr (actual error) text before/with id?
+        if stderr.rstrip(b'\n') != id_b:
+            self.close()
+            msg = stderr.decode('UTF-8', 'replace')
+            raise _stderr2oserror(msg, f'{self._host}:{self._path}')
+        return self
 
     def close(self):
-        self._close(self.file, self.proc, CalledProcessError)
+        if self._proc:
+            if self._proc.stdin:
+                self._proc.stdin.close()
+            if self._proc.stdout:
+                self._proc.stdout.close()
+            if self._proc.stderr:
+                self._proc.stderr.close()
+            if self._proc.wait(10) is None:
+                self._proc.terminate()
+                if self._proc.wait(1) is None:
+                    self._proc.kill()
+                    self._proc.wait()
+            self._proc.__del__()
+            self._proc = None
 
     @property
     def closed(self) -> bool:
-        return self.file.closed
+        return self._proc is None
+
+    def __enter__(self) -> 'TextFile':
+        return self.open()
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self):
+        self.close()
+
+    def _get_file(self) -> TextIOWrapper:
+        if self._proc:
+            if file := self._proc.stdout:
+                return cast(TextIOWrapper, file)
+            if file := self._proc.stdin:
+                return cast(TextIOWrapper, file)
+        raise ValueError('I/O operation on closed file')
 
     def fileno(self) -> int:
-        return self.file.fileno()
+        return self._get_file().fileno()
 
     def flush(self):
-        self.file.flush()
+        self._get_file().flush()
 
     @property
     def encoding(self) -> str:
-        return self.file.encoding
+        return self._encoding
 
     @property
     def errors(self) -> str | None:
-        return self.file.errors
+        return self._errors
 
     @property
     def newlines(self) -> str | tuple[str, ...] | None:
-        return self.file.newlines
+        return self._get_file().newlines
 
     def isatty(self) -> bool:
         return False
@@ -375,72 +537,173 @@ class TextFile(TextIOWrapper):
         return False
 
     def tell(self) -> int:
-        return self.file.tell()
+        return self._get_file().tell()
 
     def readable(self) -> bool:
-        return self.file.readable()
+        ans = self._proc and self._proc.stdout and self._proc.stdout.readable()
+        return bool(ans)
 
     def read(self, size=-1) -> str:
-        return self.file.read(size)
+        return self._get_file().read(size)
 
     def readline(self, size=-1) -> str:
-        return self.file.readline(size)
+        return self._get_file().readline(size)
 
     def readlines(self, hint: int = -1) -> list[str]:
-        return self.file.readlines(hint)
+        return self._get_file().readlines(hint)
 
     def writable(self) -> bool:
-        return self.file.writable()
+        ans = self._proc and self._proc.stdin and self._proc.stdin.writable()
+        return bool(ans)
 
     def write(self, text: str) -> int:
-        return self.file.write(text)
+        return self._get_file().write(text)
 
     def __next__(self) -> str:
-        if line := self.file.readline():
+        if line := self.readline():
             return line
         raise StopIteration
 
+    @property
+    def host(self) -> str:
+        '''hostname'''
+        return self._host
+
+    @property
+    def path(self) -> str:
+        '''remote path (not including hostname)'''
+        return self._path
+
+    @property
+    def name(self) -> str:
+        '''remote path including hostname, e.g. "user@host:path/to/file.txt"'''
+        return f'{self._host}:{self._path}'
+
     def __repr__(self) -> str:
         name = self.__class__.__name__
-        return  f'{name}(proc={self.proc!r}, file={self.file!r})'
+        return  f'{name}({self._host!r}, {self._path!r}, {self._mode!r}'
 
 
 class BinaryFile(BufferedIOBase):
     '''binary file opened over SSH'''
 
-    def __init__(self, proc: _Popen, file: BufferedIOBase):
-        self.proc = proc
-        self.file = file
-        # use weakref so that open(..).write(...) immediately flushes & closes
-        self._finalize = weakref.finalize(
-            self, self._close, self.file, self.proc, CalledProcessError
-        )
+    def __init__(
+        self, host: str | Host, path: str, mode: _MODE_STR = 'rb',
+        **opts: str | int | float | bool
+    ):
+        # binary required
+        if 'b' not in mode:
+            raise ValueError('BinaryFile must be opened in binary mode')
+        # store arguments
+        if isinstance(host, Host):
+            self._host, host_opts = host.host, host.opts
+            self._opts = _MULTIPLEX_OPTS | host_opts | opts
+        else:
+            self._host = host
+            self._opts = dict(opts)
+        self._path = path
+        self._mode = mode
+        self._proc = None
+        # open the connection and file
+        self.open()
 
-    @staticmethod
-    def _close(file: BufferedIOBase, proc: _Popen, CalledProcessError: type):
-        file.close()
-        if returncode := proc.wait():
-            raise CalledProcessError(returncode, proc.args)
-
-    def remove(self):
-        self._finalize()
-
-    @property
-    def removed(self) -> bool:
-        return not self._finalize.alive
+    def open(self) -> 'BinaryFile':
+        if self._proc:
+            return self
+        args = _ssh_opt_args(self._opts)
+        # this ID is used to ensure stderr has actually finished transmitting
+        id_b = bytes(random.choices(_ID_CHARS, k=22))
+        id = id_b.decode()
+        # set up & run a `cat` command such that:
+        # - avoid acknowledgement on file error: `(...)<file`:
+        # - csh/tcsh compatibility: `> /dev/stderr` instead of `>&2`
+        # - csh/tcsh compatibility: `()` instead of `{}`
+        # - prevent aliasing: `\` prefixes for `echo` and `cat`
+        # - spaces between certain tokens for compatibility w/ some shells
+        # read mode
+        if self._mode in {'rb', 'br'}:
+            cmd = ['ssh', *args, self._host, '--', (
+                rf'( \echo {id} > /dev/stderr; \cat; ) < {quote(self._path)}'
+                rf' || \echo error {id} > /dev/stderr'
+            )]
+            self._proc = _Popen(cmd, stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
+        # write mode
+        elif self._mode in {'wb', 'bw'}:
+            cmd = ['ssh', *args, self._host, '--', (
+                rf'( \echo {id} > /dev/stderr; \cat; ) > {quote(self._path)}'
+                rf' || \echo error {id} > /dev/stderr'
+            )]
+            self._proc = _Popen(cmd, stdin=PIPE, stdout=DEVNULL, stderr=PIPE)
+        # append mode
+        elif self._mode in {'ab', 'ba'}:
+            cmd = ['ssh', *args, self._host, '--', (
+                rf'( \echo {id} > /dev/stderr; \cat; ) >> {quote(self._path)}'
+                rf' || \echo error {id} > /dev/stderr'
+            )]
+            self._proc = _Popen(cmd, stdin=PIPE, stdout=DEVNULL, stderr=PIPE)
+        # unknown file mode
+        else:
+            raise ValueError('SSH binary file mode must be rb, wb, or ab')
+        # read stderr until id is found
+        stderr = b''
+        while id_b not in stderr:
+            # read the next readable block of bytes from the stderr buffer
+            if data := cast(BytesIO, self._proc.stderr).read1():
+                stderr += data
+            # EOF before id?
+            else:
+                self.close()
+                msg = 'Unexpected stderr from ssh'
+                raise OSError(32, msg, f'{self._host}:{self._path}')
+        # other stderr (actual error) text before/with id?
+        if stderr.rstrip(b'\n') != id_b:
+            self.close()
+            msg = stderr.decode('UTF-8', 'replace')
+            raise _stderr2oserror(msg, f'{self._host}:{self._path}')
+        return self
 
     def close(self):
-        self._close(self.file, self.proc, CalledProcessError)
+        if self._proc:
+            if self._proc.stdin:
+                self._proc.stdin.close()
+            if self._proc.stdout:
+                self._proc.stdout.close()
+            if self._proc.stderr:
+                self._proc.stderr.close()
+            if self._proc.wait(10) is None:
+                self._proc.terminate()
+                if self._proc.wait(1) is None:
+                    self._proc.kill()
+                    self._proc.wait()
+            self._proc.__del__()
+            self._proc = None
 
     @property
     def closed(self) -> bool:
-        return self.file.closed
+        return self._proc is None
+
+    def __enter__(self) -> 'BinaryFile':
+        return self.open()
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self):
+        self.close()
+
+    def _get_file(self) -> BytesIO:
+        if self._proc:
+            if file := self._proc.stdout:
+                return cast(BytesIO, file)
+            if file := self._proc.stdin:
+                return cast(BytesIO, file)
+        raise ValueError('I/O operation on closed file')
 
     def fileno(self) -> int:
-        return self.file.fileno()
+        return self._get_file().fileno()
 
     def flush(self):
-        self.file.flush()
+        self._get_file().flush()
 
     def isatty(self) -> bool:
         return False
@@ -449,43 +712,60 @@ class BinaryFile(BufferedIOBase):
         return False
 
     def tell(self) -> int:
-        return self.file.tell()
+        return self._get_file().tell()
 
     def readable(self) -> bool:
-        return self.file.readable()
+        ans = self._proc and self._proc.stdout and self._proc.stdout.readable()
+        return bool(ans)
 
     def read(self, size=-1) -> bytes:
-        return self.file.read(size)
+        return self._get_file().read(size)
 
     def read1(self, size: int = -1) -> bytes:
-        return self.file.read1(size)
+        return self._get_file().read1(size)
 
     def readinto(self, buffer: bytearray | memoryview) -> int:
-        return self.file.readinto(buffer)
+        return self._get_file().readinto(buffer)
 
     def readinto1(self, buffer: bytearray | memoryview) -> int:
-        return super().readinto1(buffer)
+        return self._get_file().readinto1(buffer)
 
     def readline(self, size=-1) -> bytes:
-        return self.file.readline(size)
+        return self._get_file().readline(size)
 
     def readlines(self, hint: int = -1) -> list[bytes]:
-        return self.file.readlines(hint)
+        return self._get_file().readlines(hint)
 
     def writable(self) -> bool:
-        return self.file.writable()
+        ans = self._proc and self._proc.stdin and self._proc.stdin.writable()
+        return bool(ans)
 
     def write(self, data: bytes) -> int:
-        return self.file.write(data)
+        return self._get_file().write(data)
 
     def __next__(self) -> bytes:
-        if line := self.file.readline():
+        if line := self.readline():
             return line
         raise StopIteration
 
+    @property
+    def host(self) -> str:
+        '''hostname'''
+        return self._host
+
+    @property
+    def path(self) -> str:
+        '''remote path (not including hostname)'''
+        return self._path
+
+    @property
+    def name(self) -> str:
+        '''remote path including hostname, e.g. "user@host:path/to/file.txt"'''
+        return f'{self._host}:{self._path}'
+
     def __repr__(self) -> str:
         name = self.__class__.__name__
-        return  f'{name}(proc={self.proc!r}, file={self.file!r})'
+        return  f'{name}({self._host!r}, {self._path!r}, {self._mode!r}'
 
 
 class PrematureExit(CalledProcessError):
@@ -682,7 +962,7 @@ class Shell(MutableMapping):
             raise ValueError('Shell not ready (may need to be connected first)')
         # convert command to shell token string
         if not isinstance(cmd, str):
-            cmd = ' '.join(map(_quote, cmd))
+            cmd = ' '.join(map(quote, cmd))
         # clear cached values
         self._cache.clear()
         # send the command to remote shell loop
@@ -817,14 +1097,14 @@ class Shell(MutableMapping):
         '''list remote directory'''
         # construct ls-like command with machine-readable output
         if path and path not in '.':
-            qpath = _quote(path)
+            qpath = quote(path)
             cmd = (
                 # test if path is a non-directory file
                 f'\\[ -e {qpath} -a \\! -d {qpath} ]'
                 # if so, then print the file alone
                 f' && printf "%s\\0" {qpath}'
                 # otherwise, cd to the directory and run find
-                f' || (\\cd {_quote(path)} && \\find . -maxdepth 1 -print0)'
+                f' || (\\cd {quote(path)} && \\find . -maxdepth 1 -print0)'
             )
         else:
             # a find without cd-ing works for the current (.) directory
@@ -837,7 +1117,7 @@ class Shell(MutableMapping):
 
     def cd(self, path: str = '') -> str:
         '''change remote present working directory, returns the new `pwd`'''
-        cmd = f'\\cd {_quote(path)} && \\pwd' if path else '\\cd && \\pwd'
+        cmd = f'\\cd {quote(path)} && \\pwd' if path else '\\cd && \\pwd'
         if not (out := self._soft_call(cmd)).endswith('\n'):
             raise ValueError
         pwd = self._cache['pwd'] = out[:-1]
@@ -980,8 +1260,8 @@ class ShellOptions(MutableMapping):
         set_sign = '-' if value else '+'
         shopt_arg = '-s' if value else '-u'
         # compose and call the cmd to set option
-        cmd = f'set {set_sign}o {_quote(key)} 2>/dev/null'
-        cmd += f' || shopt {shopt_arg} {_quote(key)}'
+        cmd = f'set {set_sign}o {quote(key)} 2>/dev/null'
+        cmd += f' || shopt {shopt_arg} {quote(key)}'
         shell._soft_call(cmd)
         # remember in the cache
         if (opts := shell._cache.get('opts')) is not None:
@@ -1069,82 +1349,31 @@ def rsync(
         all_args.append(f'-essh {_ssh_opt_args(opts)}')
     cmd = 'rsync', *all_args, '-vq', '--progress', *src, (dest_path or '.')
     if verbose:
-        sys.stdout.write(f'{_join(cmd)}\n')
+        sys.stdout.write(f'{join(cmd)}\n')
     stderr = None if verbose else STDOUT
     with _Popen(cmd, stdin=DEVNULL, stdout=PIPE, stderr=stderr) as proc:
-        assert isinstance(proc.stdout, BufferedIOBase), 'rsync needs stdout'
-        for event in _rsync_events(proc.stdout):
+        for event in _rsync_events(cast(BufferedIOBase, proc.stdout)):
             callback(event)
     if proc.returncode:
         raise CalledProcessError(proc.returncode, cmd)
 
 
 def open(
-    host: str | Host,
-    path: str,
-    mode: _MODE_STR = 'r',
-    *,
-    verbose: bool = False,
-    encoding: str = 'UTF-8',
-    errors='replace',
-    **opts: str | int | float | bool
+    host: str | Host, path: str, mode: _MODE_STR = 'r',
+    encoding: str = 'UTF-8', errors='replace', **opts: str | int | float | bool
 ) -> TextIOWrapper | BufferedIOBase:
     '''open a file-like object for a remote file over SSH
 
     - any valid combination of read, write, append, text, and binary is allowed
     - seeking and `+` modes are not allowed
     - `opts` keywords set `ssh_config` options, e.g. `port=22`
-    - `verbose` sends and remote STDERR error output to the python STDOUT
     '''
-    # dereference host info
-    if isinstance(host, Host):
-        host, host_opts = host.host, host.opts
-        opts = _MULTIPLEX_OPTS | host_opts | opts
-    # decide error output
-    err = None if verbose else DEVNULL
-    # read-only
-    if mode in {'r', 'rt', 'tr', 'rb', 'br'}:
-        cmd = ['ssh', *_ssh_opt_args(opts), host, f'cat {_quote(path)}']
-        # read-only binary
-        if 'b' in mode:
-            proc = _Popen(cmd, stdin=DEVNULL, stdout=PIPE, stderr=err)
-            assert isinstance(proc.stdout, BufferedIOBase), \
-                'ssh subprocess stdout should be a BufferedIOBase'
-            return BinaryFile(proc, proc.stdout)
-        # read-only text
-        else:
-            proc = _Popen(
-                cmd, encoding=encoding, errors=errors,
-                stdin=DEVNULL, stdout=PIPE, stderr=err
-            )
-            assert isinstance(proc.stdout, TextIOWrapper), \
-                'ssh subprocess stdout should be a TextIOWrapper'
-            return TextFile(proc, proc.stdout)
-    # write-only file command
-    if mode in {'w', 'wt', 'tw', 'wb', 'bw'}:
-        cmd = ['ssh', *_ssh_opt_args(opts), host, f'cat > {_quote(path)}']
-    # append-only file command
-    elif mode in {'a', 'at', 'ta', 'ab', 'ba'}:
-        cmd = ['ssh', *_ssh_opt_args(opts), host, f'cat >> {_quote(path)}']
-    # unknown file mode
+    if mode in {'r', 'rt', 'tr', 'w', 'wt', 'tw', 'a', 'at', 'ta'}:
+        return TextFile(host, path, mode, encoding, errors, **opts)
+    elif mode in {'rb', 'br', 'wb', 'bw', 'ab', 'ba'}:
+        return BinaryFile(host, path, mode, **opts)
     else:
-        raise ValueError('SSH file mode must be r, rb, w, wb, a, or ab')
-    # open binary write/append file
-    if 'b' in mode:
-        proc = _Popen(cmd, stdin=PIPE, stdout=DEVNULL, stderr=err)
-        assert isinstance(proc.stdin, BufferedIOBase), \
-            'ssh subprocess stdout should be a BufferedIOBase'
-        return BinaryFile(proc, proc.stdin)
-    # open text write/append file
-    else:
-        proc = _Popen(
-            cmd, encoding=encoding, errors=errors,
-            stdin=PIPE, stdout=DEVNULL, stderr=err
-        )
-        assert isinstance(proc.stdin, TextIOWrapper), \
-            'ssh subprocess stdout should be a TextIOWrapper'
-        return TextFile(proc, proc.stdin)
-
+        raise ValueError(f'SSH file cannot be opened in mode {mode}')
 
 def Popen(
     host: str | Host,
@@ -1174,10 +1403,10 @@ def Popen(
         if not isinstance(cmd, str):
             cmd = next(iter(cmd))
     else:
-        cmd = _quote(cmd) if isinstance(cmd, str) else _join(cmd)
+        cmd = quote(cmd) if isinstance(cmd, str) else join(cmd)
     # add cd for cwd
     if cwd:
-        cmd = f'cd {_quote(cwd)} || exit $?; ' + cmd
+        cmd = f'cd {quote(cwd)} || exit $?; ' + cmd
     # dereference host info
     if isinstance(host, Host):
         host, host_opts = host.host, host.opts
@@ -1222,10 +1451,10 @@ def run(
         if not isinstance(cmd, str):
             cmd = next(iter(cmd))
     else:
-        cmd = _quote(cmd) if isinstance(cmd, str) else _join(cmd)
+        cmd = quote(cmd) if isinstance(cmd, str) else join(cmd)
     # add cd for cwd
     if cwd:
-        cmd = f'cd {_quote(cwd)} || exit $?; ' + cmd
+        cmd = f'cd {quote(cwd)} || exit $?; ' + cmd
     # dereference host info
     if isinstance(host, Host):
         host, host_opts = host.host, host.opts
@@ -1261,22 +1490,41 @@ def _ssh_opt_args(opts: dict[str, str | int | float | bool] = {}) -> list[str]:
         results.append(f'-o{k} {v}')
     return results
 
-def _quote(token: str) -> str:
-    '''quote a token for safe shell use, including newlines'''
-    if '\n' in token:
-        if not _SEARCH_UNSAFE(token):
-            return token.replace('\n', "$'\\n'")
-        token = token.replace("'", "'\"'\"'").replace('\n', "'$'\\n''")
+
+def _printf_esc(r: re.Match[str]) -> str:
+    '''escape a character for `printf`'''
+    return f'\\{ord(r[0]):03o}'
+
+
+def quote(token: str) -> str:
+    '''quote a sting token in the most cross-shell compatible way possible'''
+    # simple_text_with_no_spaces_can_be_a_single_token
+    if _NO_QUOTE_NEEDED(token):
+        return token
+    # 'works in single quotes, e.g. with "double quotes" and/or spaces inside'
+    if _SINGLE_QUOTABLE(token):
         return f"'{token}'"
-    elif not _SEARCH_UNSAFE(token):
-        return token or "''"
-    token = token.replace("'", "'\"'\"'")
-    return f"'{token}'"
+    # "double quotes are much more limited, but good for 'single quotes' inside"
+    if _DOUBLE_QUOTABLE(token) :
+        return f'"{token}"'
+    # "dithered 'single quotes' and "'"double quotes" are complicated but short'
+    if _DITHER_QUOTABLE(token):
+        parts = []
+        pos = 0
+        while pos < len(token):
+            if r := _RE_DITHER_QUOTE.match(token, pos):
+                parts.append (f"'{r[0]}'" if r[1] else f'"{r[0]}"')
+                pos = r.end()
+            else:
+                raise ValueError('what do I do?')
+        return ''.join(parts)
+    # "`printf 'Why?\012Why on Earth would you put a newline in a token???'`"
+    return f'''"`printf '{_SUB_PRINTF_ESC(_printf_esc, token)}'`"'''
 
 
-def _join(tokens: Iterable[str]) -> str:
+def join(tokens: Iterable[str]) -> str:
     '''convert verbatim argument list to safe command string'''
-    return ' '.join(map(_quote, tokens))
+    return ' '.join(map(quote, tokens))
 
 
 def __dir__() -> tuple[str, ...]:
@@ -1285,16 +1533,19 @@ def __dir__() -> tuple[str, ...]:
 
 
 _EXPORTS = tuple(export.__name__ for export in (
+    run,
     Host,
     Shell,
+    ShellOptions,
+    Popen,
     open,
     TextFile,
     BinaryFile,
     PrematureExit,
+    RsyncEvent,
     rsync,
     rsync_decode,
-    RsyncEvent,
-    run,
-    Popen,
-    NOOP,
+    quote,
+    join,
+    NOOP
 ))
