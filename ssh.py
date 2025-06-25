@@ -7,7 +7,7 @@ from subprocess import CompletedProcess, CalledProcessError
 from subprocess import DEVNULL, PIPE, STDOUT, TimeoutExpired
 from subprocess import run as _run, Popen as _Popen
 from io import BytesIO, BufferedIOBase, BufferedReader, TextIOWrapper, IOBase
-from typing import cast, Any, IO, ItemsView, KeysView, Literal
+from typing import cast, Any, IO, ItemsView, KeysView, Literal, TypeVar
 from collections.abc import Callable, Generator, Iterable, Iterator
 from collections.abc import MutableMapping
 import datetime
@@ -16,6 +16,7 @@ import random
 import re
 import sys
 import weakref
+T = TypeVar("T")
 
 # TODO csh / tcsh environment variable parsing and `Shell` support
 
@@ -512,11 +513,24 @@ class TextFile(TextIOWrapper):
                 return cast(TextIOWrapper, file)
         raise ValueError('I/O operation on closed file')
 
+    def _error_wrap(self, input: T = None) -> T:
+        if self._proc and self._proc.poll():
+            msg = ''
+            if self._proc.stderr:
+                try:
+                    if not isinstance(msg := self._proc.stderr.read(), str):
+                        msg = cast(bytes, msg).decode('UTF-8', 'replace')
+                except Exception:
+                    pass
+            raise _stderr2oserror(msg, f'{self._host}:{self._path}')
+        return input
+
     def fileno(self) -> int:
         return self._get_file().fileno()
 
     def flush(self):
         self._get_file().flush()
+        self._error_wrap()
 
     @property
     def encoding(self) -> str:
@@ -544,20 +558,20 @@ class TextFile(TextIOWrapper):
         return bool(ans)
 
     def read(self, size=-1) -> str:
-        return self._get_file().read(size)
+        return self._error_wrap(self._error_wrap(self._get_file().read(size)))
 
     def readline(self, size=-1) -> str:
-        return self._get_file().readline(size)
+        return self._error_wrap(self._get_file().readline(size))
 
     def readlines(self, hint: int = -1) -> list[str]:
-        return self._get_file().readlines(hint)
+        return self._error_wrap(self._get_file().readlines(hint))
 
     def writable(self) -> bool:
         ans = self._proc and self._proc.stdin and self._proc.stdin.writable()
         return bool(ans)
 
     def write(self, text: str) -> int:
-        return self._get_file().write(text)
+        return self._error_wrap(self._get_file().write(text))
 
     def __next__(self) -> str:
         if line := self.readline():
@@ -699,11 +713,24 @@ class BinaryFile(BufferedIOBase):
                 return cast(BytesIO, file)
         raise ValueError('I/O operation on closed file')
 
+    def _error_wrap(self, input: T = None) -> T:
+        if self._proc and self._proc.poll():
+            msg = b''
+            if self._proc.stderr:
+                try:
+                    msg = cast(BytesIO, self._proc.stderr).read()
+                except Exception:
+                    pass
+            msg_text = msg.decode('UTF-8', 'replace')
+            raise _stderr2oserror(msg_text, f'{self._host}:{self._path}')
+        return input
+
     def fileno(self) -> int:
         return self._get_file().fileno()
 
     def flush(self):
         self._get_file().flush()
+        self._error_wrap()
 
     def isatty(self) -> bool:
         return False
@@ -719,29 +746,29 @@ class BinaryFile(BufferedIOBase):
         return bool(ans)
 
     def read(self, size=-1) -> bytes:
-        return self._get_file().read(size)
+        return self._error_wrap(self._get_file().read(size))
 
     def read1(self, size: int = -1) -> bytes:
-        return self._get_file().read1(size)
+        return self._error_wrap(self._get_file().read1(size))
 
     def readinto(self, buffer: bytearray | memoryview) -> int:
-        return self._get_file().readinto(buffer)
+        return self._error_wrap(self._get_file().readinto(buffer))
 
     def readinto1(self, buffer: bytearray | memoryview) -> int:
-        return self._get_file().readinto1(buffer)
+        return self._error_wrap(self._get_file().readinto1(buffer))
 
     def readline(self, size=-1) -> bytes:
-        return self._get_file().readline(size)
+        return self._error_wrap(self._get_file().readline(size))
 
     def readlines(self, hint: int = -1) -> list[bytes]:
-        return self._get_file().readlines(hint)
+        return self._error_wrap(self._get_file().readlines(hint))
 
     def writable(self) -> bool:
         ans = self._proc and self._proc.stdin and self._proc.stdin.writable()
         return bool(ans)
 
     def write(self, data: bytes) -> int:
-        return self._get_file().write(data)
+        return self._error_wrap(self._get_file().write(data))
 
     def __next__(self) -> bytes:
         if line := self.readline():
