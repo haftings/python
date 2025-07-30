@@ -1,3 +1,3 @@
 '''Python utilities for interacting with DiFX'''
 
-from . import input
+from . import input, visibilities

@@ -365,3 +365,5 @@ class Input(MutableMapping):
             out.append(f'# {k.upper()} #'.ljust(20, '#') + '!\n')
             out.append(str(v))
         return ''.join(out)
+
+    # TODO: add n_chan() function to simplify visibilities.records()
