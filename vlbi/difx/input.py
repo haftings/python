@@ -133,7 +133,8 @@ class Section(MutableMapping):
 
     def ingest(self, text: str):
         # first set up storage variables
-        index_prefix: tuple[int, ...] = ()
+        pol_prod_index: tuple[int, ...] = ()
+        telescope_index: tuple[int, ...] = ()
         arrays: dict[str, dict[int, Any]] = {}
         # now go through each line
         for line in RE_INPUT_LINE.finditer(text):
@@ -160,23 +161,27 @@ class Section(MutableMapping):
                     msg = repr(line['value']) + ' (expected integer)'
                     raise ValueError(f'bad telescope index: {msg}')
                 # make sure the value is the next positive integer
-                next_index = index_prefix[0] + 1 if index_prefix else 0
+                next_index = telescope_index[0] + 1 if telescope_index else 0
                 if v != next_index:
                     msg = f'{v} (expected {next_index})'
                     raise ValueError(f'wrong telescope index: {msg}')
                 # store the new index prefix and continue
-                index_prefix = (v,)
+                telescope_index = (v,)
                 _array_into_dict(arrays.setdefault(name, {}), (v,), v)
             # new pol products? (set as index, used as hidden index prefix)
             elif name == 'pol products':
                 index_strs = RE_INDEX.findall(line['name'])
-                index_prefix = tuple(
+                pol_prod_index = tuple(
                     int(i) for ii in index_strs for i in ii if i != ''
                 )
-                _array_into_dict(arrays.setdefault(name, {}), index_prefix, v)
+                _array_into_dict(arrays.setdefault(name, {}), pol_prod_index, v)
             # inside of an array? (if there's an index)
-            elif (index_strs := RE_INDEX.findall(line['name'])) or index_prefix:
-                index = index_prefix + tuple(
+            elif (
+                (index_strs := RE_INDEX.findall(line['name'])) or
+                telescope_index or (pol_prod_index and name.endswith(' band'))
+            ):
+                ppi = pol_prod_index if name.endswith(' band') else ()
+                index = telescope_index + ppi + tuple(
                     int(i) for ii in index_strs for i in ii if i != ''
                 )
                 _array_into_dict(arrays.setdefault(name, {}), index, v)
@@ -366,4 +371,19 @@ class Input(MutableMapping):
             out.append(str(v))
         return ''.join(out)
 
-    # TODO: add n_chan() function to simplify visibilities.records()
+    def n_chans(self) -> list[int] | int:
+        '''number of FFT channels'''
+        num_channels = self['freq table'].get('num channels')
+        if num_channels is None:
+            return self['configurations']['num channels']
+        if not (chans_to_avg := self['freq table'].get('chans to avg')):
+            chans_to_avg = [1] * len(num_channels)
+        result = []
+        for i, (num, avg) in enumerate(zip(num_channels, chans_to_avg)):
+            if num % avg:
+                raise ValueError(
+                    f'NUM CHANNELS {i}: {num} is not evenly devisable by '
+                    'CHANS TO AVG {i}: {avg} in input file'
+                )
+            result.append(num // avg)
+        return result

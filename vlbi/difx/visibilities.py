@@ -1,12 +1,15 @@
 '''Provides the `Visibilities` class to represent a DiFX visibilities file'''
 
 from dataclasses import dataclass, field
-from io import BufferedIOBase, RawIOBase, BytesIO
+from io import BufferedReader, BufferedRandom, BytesIO
+import os
 from struct import Struct, pack as _pack, unpack as _unpack
-from typing import Generator
+from typing import Generator, Iterable, overload
+from . import input as _input
 
 J = complex(0, 1)
-BINARY_FILE = BufferedIOBase | RawIOBase
+NAMED_BINARY_FILE = BufferedReader | BufferedRandom
+BINARY_FILE = BufferedReader | BufferedRandom | BytesIO
 STRUCT_RECORD = Struct('<IIdIII2sIdddd')
 
 
@@ -110,89 +113,127 @@ class Record:
         return file.write(self.pack(version))
 
 
+@overload
+def records(
+    source: NAMED_BINARY_FILE | str
+) -> Generator[Record, None, None]: ...
+@overload
 def records(
     source: BINARY_FILE | bytes | str,
-    n_chan: int
+    n_chans: int | Iterable[int]
+) -> Generator[Record, None, None]: ...
+
+def records(
+    source: BINARY_FILE | bytes | str,
+    n_chans: int | Iterable[int] | None = None
 ) -> Generator[Record, None, None]:
-    # TODO infer n_chan from matching input file for str path
-    unpacker = Struct('<' + 2 * n_chan * 'f').unpack
-    unpacker_indexes = [(i, i + 1) for i in range(0, 2 * n_chan, 2)]
+    '''Yield each visibility `Record` in a DiFX visibilities file
+
+    If `n_chan` isn't set, then `records` will try to parse `n_chan` from the
+    `input` file matching the name of `source`. That can be pretty slow though,
+    so manually setting `n_chan` is provided for best performance. Manually
+    setting `n_chan` is also required for `bytes` input, or files w/o `.name`.
+    '''
+    path: str | bytes
+    # get n_chan
+    if n_chans is None:
+        # extract path
+        if isinstance(source, str):
+            path = source
+        elif isinstance(source, (BufferedReader, BufferedRandom)):
+            path = source.name
+            assert isinstance(path, str)
+        # convert to input file
+        path = os.path.dirname(path)
+        if path.endswith('.difx'):
+            path = path[:-5]
+        # read input file
+        with open(f'{path}.input') as file:
+            n_chans = _input.Input(file).n_chans()
     # read file from path
     if isinstance(source, str):
         with open(source, 'rb') as file:
-            yield from records(file, n_chan)
+            yield from records(file, n_chans)
+            return
     # accept verbatim input data
-    elif isinstance(source, (bytes, bytearray)):
-        yield from records(BytesIO(source), n_chan)
+    if isinstance(source, (bytes, bytearray)):
+        yield from records(BytesIO(source), n_chans)
+        return
     # don't accept weird things
-    elif not isinstance(source, (BufferedIOBase, RawIOBase)):
+    if not isinstance(source, (BufferedReader, BufferedRandom, BytesIO)):
         msg = 'Visibility source must be binary file, bytes, or str'
         raise ValueError(msg)
-    # read open binary file
-    else:
-        while True:
-            if not (magic := source.read(8)):
-                break
-            elif magic == b'\x00\xff\x00\xff\x01\x00\x00\x00':
-                if n_chan is None:
-                    msg = 'n_chan required to parse binary DiFX visibilities'
+    # create visibility struct unpackers
+    unpacker = {}
+    unpacker_indexes = {}
+    if isinstance(n_chans, Iterable) and not isinstance(n_chans, list):
+        n_chans = list(n_chans)
+    for n_chan in n_chans if isinstance(n_chans, list) else [n_chans]:
+        unpacker[n_chan] = Struct('<' + 2 * n_chan * 'f').unpack
+        unpacker_indexes[n_chan] = [(i, i + 1) for i in range(0, 2 * n_chan, 2)]
+    # loop over records
+    while True:
+        if not (magic := source.read(8)):
+            break
+        elif magic == b'\x00\xff\x00\xff\x01\x00\x00\x00':
+            (
+                baseline, mjd, sec, config, src, freq, pols, pulsar,
+                weight, u, v, w
+            ) = STRUCT_RECORD.unpack(source.read(STRUCT_RECORD.size))
+            n_chan = n_chans[freq] if isinstance(n_chans, list) else n_chans
+            x = unpacker[n_chan](source.read(8 * n_chan))
+            x = [J * x[j] + x[i] for i, j in unpacker_indexes[n_chan]]
+            # note: J * imag + real is the fastest way to create a complex
+            bl = baseline // 256, baseline % 256
+            try:
+                yield Record(
+                    1, bl, mjd, sec, config, src, freq,
+                    pols.decode('utf-8'), pulsar, 0, weight, u, v, w, x
+                )
+            except ValueError:
+                raise ValueError('Unrecognized data in DiFX visibilities')
+        elif magic == b'BASELINE':
+            values = []
+            for key in (
+                b'NUM',  # truncated because 'BASELINE' already read
+                b'MJD', b'SECONDS',
+                b'CONFIG INDEX', b'SOURCE INDEX', b'FREQ INDEX',
+                b'POLARISATION PAIR', b'PULSAR BIN', b'FLAGGED',
+                b'DATA WEIGHT', b'U (METRES)', b'V (METRES)', b'W (METRES)'
+            ):
+                k, _, value = source.readline().partition(b':')
+                if k.strip() != key:
+                    if key == b' NUM':
+                        k, key = b'BASELINE' + k, b'BASELINE' + key
+                    msg = 'Unrecognized data in DiFX visibilities: '
+                    msg += f'expected {key!r}, got {k!r}'
                     raise ValueError(msg)
-                (
-                    baseline, mjd, sec, config, src, freq, pols, pulsar,
-                    weight, u, v, w
-                ) = STRUCT_RECORD.unpack(source.read(STRUCT_RECORD.size))
-                x = unpacker(source.read(8 * n_chan))
-                x = [J * x[j] + x[i] for i, j in unpacker_indexes]
-                # note: J * imag + real is the fastest way to create a complex
+                values.append(value)
+            (
+                baseline, mjd, sec, config, src, freq, pols, pulsar,
+                flagged, weight, u, v, w
+            ) = values
+            freq = int(freq)
+            n_chan = n_chans[freq] if isinstance(n_chans, list) else n_chans
+            x = unpacker[n_chan](source.read(8 * n_chan))
+            x = [J * x[j] + x[i] for i, j in unpacker_indexes[n_chan]]
+            # note: J * imag + real is the fastest way to create a complex
+            try:
+                baseline = int(baseline)
                 bl = baseline // 256, baseline % 256
-                try:
-                    yield Record(
-                        1, bl, mjd, sec, config, src, freq,
-                        pols.decode('utf-8'), pulsar, 0, weight, u, v, w, x
-                    )
-                except ValueError:
-                    raise ValueError('Unrecognized data in DiFX visibilities')
-            elif magic == b'BASELINE':
-                values = []
-                for key in (
-                    b'NUM',  # truncated because 'BASELINE' already read
-                    b'MJD', b'SECONDS',
-                    b'CONFIG INDEX', b'SOURCE INDEX', b'FREQ INDEX',
-                    b'POLARISATION PAIR', b'PULSAR BIN', b'FLAGGED',
-                    b'DATA WEIGHT', b'U (METRES)', b'V (METRES)', b'W (METRES)'
-                ):
-                    k, _, value = source.readline().partition(b':')
-                    if k.strip() != key:
-                        if key == b' NUM':
-                            k, key = b'BASELINE' + k, b'BASELINE' + key
-                        msg = 'Unrecognized data in DiFX visibilities: '
-                        msg += f'expected {key!r}, got {k!r}'
-                        raise ValueError(msg)
-                    values.append(value)
-                (
-                    baseline, mjd, sec, config, src, freq, pols, pulsar,
-                    flagged, weight, u, v, w
-                ) = values
-                x = unpacker(source.read(8 * n_chan))
-                x = [J * x[j] + x[i] for i, j in unpacker_indexes]
-                # note: J * imag + real is the fastest way to create a complex
-                try:
-                    baseline = int(baseline)
-                    bl = baseline // 256, baseline % 256
-                    yield Record(
-                        0, bl, int(mjd), float(sec), int(config), int(src),
-                        int(freq), pols.strip().decode('utf-8'),
-                        int(pulsar), int(flagged), float(weight),
-                        float(u), float(v), float(w), x
-                    )
-                except ValueError:
-                    raise ValueError('Unrecognized data in DiFX visibilities')
-            elif len(magic) == 8 and magic.startswith(b'\x00\xff\x00\xff'):
-                ver = _unpack('<I', magic[4:8])[0]
-                msg = f'DiFX visibilities format version {ver} not supported'
-                raise ValueError(msg)
-            else:
-                sync = ''.join(f'{i:02x}' for i in reversed(magic[:4]))
-                msg = 'Unrecognized sync word in DiFX visibilities: '
-                msg += f'expected 0xFF00FF00, got 0x{sync}'
-                raise ValueError(f'{msg}: Are you sure {n_chan = }?')
+                yield Record(
+                    0, bl, int(mjd), float(sec), int(config), int(src),
+                    freq, pols.strip().decode('utf-8'), int(pulsar),
+                    int(flagged), float(weight), float(u), float(v), float(w), x
+                )
+            except ValueError:
+                raise ValueError('Unrecognized data in DiFX visibilities')
+        elif len(magic) == 8 and magic.startswith(b'\x00\xff\x00\xff'):
+            ver = _unpack('<I', magic[4:8])[0]
+            msg = f'DiFX visibilities format version {ver} not supported'
+            raise ValueError(msg)
+        else:
+            sync = ''.join(f'{i:02x}' for i in reversed(magic[:4]))
+            msg = 'Unrecognized sync word in DiFX visibilities: '
+            msg += f'expected 0xFF00FF00, got 0x{sync}'
+            raise ValueError(f'{msg}: Are you sure {n_chans = }?')
