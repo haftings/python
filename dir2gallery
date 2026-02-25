@@ -1,0 +1,442 @@
+#! /usr/bin/env python3
+
+'''Recursively convert a directory of images and/or videos to a simple HTML gallery'''
+
+# TODO Video icon on video thumbnails
+# TODO Ensure that thumbs for /path/to previews show up in thumbs for /path/to/dir and so on
+# TODO Implement [Ctrl|Cmd] + S = Save Media in gallery view
+# TODO Implement a side-bar with metadata and/or associated text/markdown file
+
+import argparse
+import base64
+import dataclasses
+import os
+import random
+import re
+import shutil
+import sys
+import zlib
+from concurrent.futures import ThreadPoolExecutor, Future
+from typing import Callable, Iterable
+from html import escape as html_escape
+from shlex import quote as sh_escape
+from urllib.parse import quote as url_escape
+from subprocess import run, PIPE
+from tempfile import TemporaryDirectory
+
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+HTML = '''<!doctype html>
+<html>
+    <head>
+        <style>
+            body {{
+                color: white; background-color: #1b1f20;
+                font-size: 16pt; font-family: Arial,sans; text-align: center;
+            }}
+            a:link {{ color: #00b7ff; }}
+            a:visited {{ color: #b974bb; }}
+            p {{ margin: 5pt; padding: 5pt; border-radius: 5pt; }}
+            a:hover p, a:focus p {{
+                background-color: rgba(255, 255, 255, 0.1);
+            }}
+            .thumb {{ max-height: 350px; max-width: 350px; border-radius: 2pt; }}
+            .thumb:hover {{ outline: solid 2pt #00a3d5; }}
+            .info {{ font-style: italic; opacity: 0.5; }}
+            .img, .vid {{ display: inline-block; margin: 6pt 0; padding: 0; }}
+            .desc {{ font-size: 8pt; font-style: italic; }}
+            table img {{ max-width: 200px; max-height: 200px; }}
+            table {{
+                display: inline-block; background-color: rgba(180,200,255,.2);
+                padding: 5px; border-radius: 5px;
+            }}
+            table:hover {{ background-color: rgba(180,200,255,.4);}}
+            img[src="."] {{ display: none; }}
+            #overlay {{
+                position: fixed; inset: 0; display: none;
+                background: rgba(0,0,0,.8); backdrop-filter: blur(10pt);
+                justify-content: safe center; align-items: safe center; overflow: auto;
+            }}
+            #overlay.enabled {{ display: flex; }}
+            #overlay_img, #overlay_vid {{ display: none; }}
+            #overlay_img.enabled, #overlay_vid.enabled, #close.enabled {{ display: block; }}
+            #overlay_img.fit {{ max-height: 100%; max-width: 100%; }}
+            #close {{
+                display: none; cursor: pointer;
+                position: fixed; top: 4pt; right: 14pt; height: 28pt; width: 28pt; border-radius: 24pt;
+                font-size: 24pt; color: #fff; background-color: rgba(0,0,0,.5); box-shadow: rgba(0,0,0,.5) 0 2pt 5pt;
+            }}
+        </style>
+        <script>
+            CURRENT_MEDIA = ''
+            IS_MAC = /mac/i.test(window.navigator.platform)
+            ID = (id) => document.getElementById(id)
+            CLASS = (cls) => document.getElementsByClassName(cls)
+            size2text = (size) => {{
+                size = parseInt(size)
+                if (size <= 999) return `{{size}} B`
+                for (const [scale, unit] of ['KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB'].entries()) {{
+                    let text = (size / 1024 ** (scale + 1)).toFixed(3)
+                    if (text.length <= 7) return `${{text}} ${{unit}}`
+                }}
+                return `${{(size / 1024 ** 8).toFixed(3)}} YiB`
+            }}
+            close_overlay = () => {{
+                ID('overlay').classList.remove('enabled')
+                ID('overlay_img').src = ''
+                ID('overlay_vid').src = ''
+                console.log('here')
+                ID('close').classList.remove('enabled')
+                for (const i of CLASS('open')) i.classList.remove('open')
+            }}
+            document.addEventListener('keydown', (e) => {{
+                let x
+                if (e.key == 'ArrowLeft') {{
+                    if (x = CLASS('open')[0]) {{
+                        x = x.parentElement
+                        if (x.previousElementSibling) x.previousElementSibling.click()
+                        else Array.from(x.parentElement.children).at(-1).click()
+                    }} else ID('prev').click()
+                }} else if (e.key == 'ArrowRight') {{
+                    if (x = CLASS('open')[0]) {{
+                        x = x.parentElement
+                        if (x.nextElementSibling) x.nextElementSibling.click()
+                        else x.parentElement.children[0].click()
+                    }} else ID('next').click()
+                }} else if (e.shiftKey) {{
+                    if (e.key == 'ArrowUp') ID('up').click()
+                    else if (e.key == 'ArrowDown') {{
+                        if (x = CLASS('dir')[0]) x.click()
+                    }}
+                }} else if (IS_MAC ? e.metaKey : e.ctrlKey) {{
+                    if (e.key == 'c' && window.getSelection().type != 'Range') {{
+                        if (ID('overlay').classList.contains('enabled')) x = CURRENT_MEDIA
+                        else x = window.location.href.replace(/\\/gallery\\.html$/, '')
+                        window.navigator.clipboard.writeText(x)
+                        e.preventDefault()
+                    }}
+                }} else if (e.key == 'Escape') close_overlay()
+            }})
+            window.addEventListener('load', () => {{
+                ID('overlay').addEventListener('click', close_overlay)
+                ID('overlay_img').addEventListener('click', (e) => {{
+                    e.target.classList.toggle('fit')
+                    e.stopPropagation()
+                }})
+                document.querySelectorAll('img.thumb, video.thumb').forEach(i => {{
+                    i.title = decodeURIComponent(i.src.replace(/.*[/]/, ''))
+                    const txt = i.parentElement.getElementsByClassName('desc')[0]
+                    const ext = decodeURIComponent(i.parentElement.href.replace(/.*\\.(?=.)/, '')).toLowerCase()
+                    const size = size2text(txt.dataset.size)
+                    const width = i.tagName == 'IMG' ? i.naturalWidth : i.videoWidth
+                    const height = i.tagName == 'IMG' ? i.naturalHeight : i.videoHeight
+                    txt.textContent = `${{width}} x ${{height}} (${{size}}) ${{ext}}`
+                    i.parentElement.addEventListener('click', (e) => {{
+                        for (const x of CLASS('open')) x.classList.remove('open')
+                        i.classList.add('open')
+                        const img = ID('overlay_img')
+                        const vid = ID('overlay_vid')
+                        if (i.parentElement.classList.contains('img')) {{
+                            img.src = i.parentElement.href
+                            vid.classList.remove('enabled')
+                            vid.src = ''
+                            img.classList.add('enabled')
+                        }} else {{
+                            vid.src = i.parentElement.href
+                            img.classList.remove('enabled')
+                            img.src = ''
+                            vid.classList.add('enabled')
+                        }}
+                        ID('overlay').classList.add('enabled')
+                        ID('close').classList.add('enabled')
+                        e.preventDefault()
+                    }})
+                }})
+            }})
+        </script>
+    </head>
+    <body>
+        <p class='nav'>
+            <a id='up' href='{up}'>⭡ {parent} ⭡</a><br>
+            <a id='prev' href='{prev}'>⭠ prev</a> &nbsp; {name} &nbsp; <a id='next' href='{next}'>next ⭢</a>
+        </p>
+        {links}
+        <p></p>
+        <div>\n{content}\
+        </div>
+        <p class='nav'><a href='{up}'>⭡ {parent} ⭡</a><br><a href='{prev}'>⭠ prev</a> &nbsp; {name} &nbsp; <a href='{next}'>next ⭢</a></p>
+        <div id='overlay'>
+            <img id='overlay_img' class='fit'>
+            <video id='overlay_vid' controls loop autoplay></video>
+        </div>
+        <div id='close' onclick='close_overlay()'>×</div>
+    </body>
+</html>
+'''
+TAB = '            '
+DIR = '''
+            <a class='dir' href='{href}/gallery.html'><table>
+                <tr><td colspan='2' class='dirname'>{name}</td></tr>
+                <tr><td><img src='{img1}'></td><td><img src='{img2}'></td></tr>
+                <tr><td><img src='{img3}'></td><td><img src='{img4}'></td></tr>
+                <tr><td colspan='2' class='info'>{counts}</td></tr>
+            </table></a>
+'''.lstrip('\n')
+IMG = TAB + '''<a class='{cls}' href='{href}'><img class='thumb' src='{src}'><div class="desc" data-size='{size}'>...</div></a>\n'''
+IMG_EXT = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'svg'}
+VID_EXT = {'mp4', 'avi', 'webm', 'mov', 'flv', 'mkv'}
+MEDIA_EXT = IMG_EXT | VID_EXT
+RE_LINK = re.compile(r'^(?:./)*([^/]*)/*$')
+RE_MULTI_SLASH = re.compile(r'/(/|\./)+')
+
+# A 350x350 jpg with just a black background
+BLANK_THUMB = zlib.decompress(base64.decodebytes(
+    b'eJz7f+P/Q4ZTrhWZaQwMvr4MWgwMDBwMbIxCDMxAFiMQMjBKMbCC2QwMYYzScHYcowZUDRMDA5MwQn17JgMLVA3QTDDwgPIhNPsEBgZ2IIvF'
+    b'wMjIcCIjhM3IxMywACZuaGCwgBFh4gImmImMcQuYEewlbFA1cPD/NkMLAwcY8AKREC8vr5CkEBBIykuCgLyaPBioQYEuGJiCgDUcMHJycfHz'
+    b'8Uvx8UnZaSlp2ZEM/t8FulHs/wEGQQ7GOMY4ZkYlBiZBRmZBxv9HGBcB3cvKCAYwRwO9zsLKxs7BycUtwMDEyMzMxMLMysoC9CZjLShYWARZ'
+    b'hRQNHdmEAxPZlQpFjBonLuRQdtp4UDTo4gcV46SiJk4uMXEJSSlVNXUNTS0TUzNzC0srZxdXN3cPT6/gkNCw8IjIqOSU1LT0jMys4pLSsvKK'
+    b'yqrmlta29o7OrkmTp0ydNn3GzFmLFi9Zumz5ipWrNm3esnXb9h07dx06fOToseMnTp66dPnK1WvXb9y89fDR4ydPnz1/8fLVx0+fv3z99v3H'
+    b'z1/AeGKEAQz/CAL9w8TCwszCDvIPI1M5SFKQhVXRkE3IMZA9sVBYyaiRQ8Rp4sKNBzmVjYM+iCYVXeQSUzF5qPoR5CWwj4jzUBNZPoJ7CO6f'
+    b'/7cYeJiBiVqQWZDBnuHnvy6NBUw0wPz/L9DQ7Is0NPsSDc2+TEOzr9DQ7Ks0NPsaDc2+Ppq+McweTd+YZo+mb0yzR9M3ptlDNX3fBACLgarP'
+))
+
+
+@dataclasses.dataclass
+class Media:
+    path: str
+    thumb_dir: str = '.thumb'
+
+    @property
+    def name(self) -> str:  return os.path.basename(self.path)
+
+    @property
+    def size(self) -> int:  return os.stat(self.path).st_size
+
+    @property
+    def is_vid(self) -> bool:  return self.path.rpartition('.')[-1] in VID_EXT
+
+    @property
+    def has_thumb(self) -> bool:  return os.path.exists(self.thumb_path)
+
+    @property
+    def thumb_path(self) -> str:
+        dir, name = os.path.split(self.path)
+        return os.path.join(dir, self.thumb_dir or '.thumb', f'{os.path.basename(self.path)}.jpg')
+
+    def thumb_relpath(self, rel_to: str | None = None) -> str:
+        rel_to = os.path.dirname(self.path) if rel_to is None else rel_to
+        return os.path.relpath(self.thumb_path, rel_to)
+
+    def mk_thumb(self, *, force: bool = False, times: Iterable[float] = (5.0, 1.0, 0.0)):
+        '''Make thumbnail if it's not already there'''
+        if force or not self.has_thumb:
+            if self.is_vid:
+                with TemporaryDirectory() as tmp_dir:
+                    tmp_path = os.path.join(tmp_dir, 'out.jpg')
+                    for time in times:
+                        timestamp = f'{int(time // 3600):02d}:{int(time // 60 % 60):02d}:{time % 60:05.2f}'
+                        cmd = ['ffmpeg', '-i', self.path, '-ss', timestamp, '-vframes', '1', tmp_path]
+                        run(cmd, stderr=PIPE, stdout=PIPE)
+                        if os.path.exists(tmp_path):
+                            os.makedirs(os.path.dirname(self.thumb_path), exist_ok=True)
+                            shutil.move(tmp_path, self.thumb_path)
+                            print(sh_escape(self.thumb_path))
+                            return
+            else:
+                try:
+                    img = Image.open(self.path)
+                    if img.mode.lower() != 'rgb':
+                        img = img.convert('RGB')
+                    if img.size[0] > img.size[1]:
+                        img = img.resize((350, int(350 * img.size[1] // img.size[0])))
+                    else:
+                        img = img.resize((int(350 * img.size[0] // img.size[1]), 350))
+                    os.makedirs(os.path.dirname(self.thumb_path), exist_ok=True)
+                    img.save(self.thumb_path)
+                    print(sh_escape(self.thumb_path))
+                    return
+                except Exception as e:
+                    sys.stderr.write(f'error making thumb for {self.path}: {e!r}\n')
+                    pass
+            sys.stderr.write(f'\033[31merror: could not create thumbnail for {sh_escape(self.path)}\033[39m\n')
+            os.makedirs(os.path.dirname(self.thumb_path), exist_ok=True)
+            with open(self.thumb_path, 'wb') as f:
+                f.write(BLANK_THUMB)
+
+
+@dataclasses.dataclass
+class Dir:
+    parent: str
+    name: str
+    path: str
+    media: list[Media]
+    dirs: list['Dir']
+    prev: str
+    up: str
+    next: str
+
+    def __repr__(self, indent: str = '') -> str:
+        lines = [f'{indent}Dir(']
+        lines.append(f'{indent}  parent={self.parent}, name={self.name!r}, path={self.path!r},')
+        lines.append(f'{indent}  media=[')
+        for media in self.media:
+            lines.append(f'{indent}    {media!r},')
+        lines.append(f'{indent}  ], dirs=[')
+        for dir in self.dirs:
+            lines.append(dir.__repr__(f'{indent}    '))
+        lines.append(f'{indent}  ], prev={self.prev!r}, up={self.up!r}, next={self.next!r}')
+        lines.append(f'{indent}),' if indent else f'{indent})')
+        return '\n'.join(lines)
+
+    def count(self) -> tuple[int, int, int]:
+        '''Count the total dirs, imgs, and vids'''
+        total_n_dir = len(self.dirs)
+        total_n_img = sum(1 for media in self.media if not media.is_vid)
+        total_n_vid = sum(1 for media in self.media if media.is_vid)
+        for dir in self.dirs:
+            n_dir, n_img, n_vid = dir.count()
+            total_n_dir += n_dir
+            total_n_img += n_img
+            total_n_vid += n_vid
+        return total_n_dir, total_n_img, total_n_vid
+
+    def media_by_index(self, i: int) -> Media:
+        '''Get media at recursive index i'''
+        if i < len(self.media):
+            return self.media[i]
+        i -= len(self.media)
+        for dir in self.dirs:
+            try:
+                return dir.media_by_index(i)
+            except IndexError:
+                _, n_img, n_vid = dir.count()
+                i -= n_img + n_vid
+        raise IndexError('there are not that many img files in the directory')
+
+    @classmethod
+    def read(
+        cls, *,
+        parent: str,
+        root_name: str,
+        root_path: str,
+        prev: str = '.',
+        up: str = '.',
+        next: str = '.',
+        thumb_dir: str | None = None
+    ) -> 'Dir':
+        dirs: list[Dir] = []
+        media: list[Media] = []
+        links: dict[str, list[str]] = {}
+        if thumb_dir is None:
+            thumb_dir = os.path.join(root_path, '.thumb')
+        # list dirs, media, links
+        for name in sorted(os.listdir(root_path), key=lambda p: (p.lower(), p)):
+            if name.startswith('.'):
+                continue
+            path = os.path.join(root_path, name)
+            if os.path.isdir(path):
+                if os.path.islink(path):
+                    if r := RE_LINK.match(os.readlink(path)):
+                        links.setdefault(r[1], []).append(name)
+                else:
+                    dirs.append(Dir(root_name, name, path, [], [], '.', '..', '.'))
+            elif path.rpartition('.')[-1].lower() in MEDIA_EXT and os.path.isfile(path):
+                media.append(Media(path, thumb_dir))
+        # decide prev and next for each dir
+        for i, dir in enumerate(list(dirs)):
+            basename = os.path.basename(dir.path)
+            if basename in links:
+                aliases = ', '.join(links[basename])
+                dir.name = f'{dir.name} ({aliases})'
+            dirs[i] = cls.read(
+                parent=root_name,
+                root_name=dir.name,
+                root_path=dir.path,
+                prev=os.path.basename(dirs[(i - 1) % len(dirs)].path),
+                up='..',
+                next=os.path.basename(dirs[(i + 1) % len(dirs)].path),
+                thumb_dir=os.path.join(thumb_dir, os.path.basename(dir.path))
+            )
+        return Dir(parent, root_name, root_path, media, dirs, prev, up, next)
+
+    def mk_thumbs(self, pool: ThreadPoolExecutor | None = None, wait: bool = True) -> list[Future]:
+        # create and use a thread pool if needed (always waits)
+        futures: list[Future] = []
+        if pool is None:
+            with ThreadPoolExecutor() as pool:
+                return self.mk_thumbs(pool)
+        # submit jobs to make thumbnails media
+        for media in self.media:
+            if not media.has_thumb:
+                futures.append(pool.submit(media.mk_thumb))
+        for dir in self.dirs:
+            futures.extend(dir.mk_thumbs(pool))
+        # wait for threads to complete
+        if wait:
+            for future in futures:
+                future.result()
+        return futures
+
+    def html(self) -> str:
+        links = ''
+        if self.dirs:
+            dir_list = []
+            for dir in self.dirs:
+                n_dir, n_img, n_vid = dir.count()
+                imgs = ['.', '.', '.', '.']
+                if n_media := n_img + n_vid:
+                    for i, j in enumerate(random.sample(range(n_media), k=min(n_media, 4))):
+                        media = dir.media_by_index(j)
+                        imgs[i] = url_escape(media.thumb_relpath(self.path))
+                dir_list.append(DIR.format(
+                    href=url_escape(os.path.basename(dir.path)),
+                    name=html_escape(dir.name),
+                    counts=', '.join(filter(None, [
+                        f'{n_dir} dirs' if n_dir else '',
+                        f'{n_img} images' if n_img else '',
+                        f'{n_vid} videos' if n_vid else '',
+                    ])) or 'empty',
+                    img1=imgs[0], img2=imgs[1], img3=imgs[2], img4=imgs[3]
+                ))
+            links = '\n        <div>\n{}        </div>'.format(''.join(dir_list))
+        # build the rest of the HTML substitutions and content
+        prev = RE_MULTI_SLASH.sub('/', os.path.join('.' if self.prev == '.' else '..', self.prev, 'gallery.html'))
+        up = RE_MULTI_SLASH.sub('/', os.path.join(self.up, 'gallery.html'))
+        next = RE_MULTI_SLASH.sub('/', os.path.join('.' if self.next == '.' else '..', self.next, 'gallery.html'))
+        prev, up, next = map(url_escape, (prev, up, next))
+        parent, name = map(html_escape, (self.parent, self.name))
+        return HTML.format(parent=parent, name=name, prev=prev, up=up, next=next, links=links, content=''.join(
+            IMG.format(
+                cls=('vid' if media.is_vid else 'img'),
+                href=url_escape(media.name),
+                src=url_escape(media.thumb_relpath()),
+                size=media.size
+            ) for media in self.media
+        ))
+
+    def save_html(self, recursive: bool = True, on_save: Callable[['Dir'], None] | None = None):
+        text = self.html()
+        with open(os.path.join(self.path, 'gallery.html'), 'w') as f:
+            f.write(text)
+        if on_save:
+            on_save(self)
+        if recursive:
+            for dir in self.dirs:
+                dir.save_html(recursive, on_save)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('root', help='root directory for gallery')
+    p.add_argument('-j', '--jobs', type=int, default=None, help='max concurrent thumbnail jobs') # TODO implement
+    a = p.parse_args()
+    name = os.path.basename(a.root.rstrip(os.path.sep))
+    gallery = Dir.read(parent=name, root_name=name, root_path=a.root)
+    gallery.mk_thumbs()
+    gallery.save_html(on_save=lambda dir: print(sh_escape(dir.path)))
+
+
+if __name__ == '__main__':
+    main()
