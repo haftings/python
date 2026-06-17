@@ -16,6 +16,7 @@ from threading import Thread
 
 # TODO: Ctrl+C should cancel SSH session(s) if running, instead of whole REPL
 # TODO: `-n` option to limit concurrent session count
+# TODO: path completions
 
 RE_HOST_SPLIT = re.compile(r'[ \t\n,;]+')
 RE_META_CMD = re.compile(r'^\s*%\s*(.*)')
@@ -147,6 +148,11 @@ def main():
         help='merge together identical output'
     )
     a = p.parse_args()
+    # store positions of hosts for use later
+    hosts_ref: dict[str, int] = {}
+    for host in a.host:
+        if host not in hosts_ref:
+            hosts_ref[host] = len(hosts_ref)
     # setup
     setup_readline()
     # repl loop
@@ -164,9 +170,10 @@ def main():
                         if not (host := host[1:]):
                             continue
                     if adding:
-                        a.host.append(host)
-                    else:
-                        a.host = [i for i in a.host if i != host]
+                        if host not in hosts_ref:
+                            hosts_ref[host] = max(hosts_ref.values()) + 1
+                    elif host in hosts_ref:
+                        del hosts_ref[host]
                 continue
             else:
                 sys.stderr.write(f'unrecognized meta command: {quote(r[1])}\n')
@@ -178,12 +185,13 @@ def main():
         cmd = RE_IGNORE_PREFIX.sub('', cmd)
         # send command to all hosts
         hosts = {}
-        for host in a.host:
+        for host in hosts_ref:
             hosts[run_ssh(host, cmd, q)] = host
         # retrieve results from all hosts
         got_responses = {id: False for id in hosts}
-        responses = {}
-        for i in range(len(a.host), 0, -1):
+        response2hosts: dict[tuple[int, str], list[str]] = {}
+        host2response: dict[str, tuple[int, str]] = {}
+        for i in range(len(hosts_ref), 0, -1):
             # show remaining hosts
             msg = f'waiting for {i} / {len(a.host)}: ' + ', '.join(
                 hosts[id] for id, got_it in got_responses.items() if not got_it
@@ -200,8 +208,8 @@ def main():
             sys.stderr.flush()
             # store response
             if a.merge:
-                content = proc.returncode, proc.stdout
-                responses.setdefault(content, []).append(host)
+                host2response[host] = response = proc.returncode, proc.stdout
+                response2hosts.setdefault(response, []).append(host)
                 continue
             # show response (error)
             sys.stdout.write(format(host, proc.returncode, proc.stdout))
@@ -209,8 +217,15 @@ def main():
         sys.stdout.write('\n')
         # show merged responses
         if a.merge:
-            for (code, text), hosts in responses.items():
-                sys.stdout.write(format(', '.join(hosts), code, text) + '\n')
+            for host in hosts_ref:
+                code, text = host2response[host]
+                if response_hosts := response2hosts.get((code, text)):
+                    hosts_str = ', '.join(sorted(
+                        response_hosts, key=(lambda h: hosts_ref[h])
+                    ))
+                    sys.stdout.write(format(hosts_str, code, text) + '\n')
+                    del response2hosts[(code, text)]
+
 
 if __name__ == '__main__':
     try:
