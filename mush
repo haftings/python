@@ -91,27 +91,30 @@ def list_hosts(prefix: str = '') -> list[str]:
     return sorted(hosts)
 
 
-_completion__list = []
+_COMPLETION__LIST = []
 def completion(text: str, state: int):
-    '''Run readline completion'''
-    with open('readline.log', 'a') as file:
-        file.write(f'{text = } {state = }\n')
+    '''Run readline completion
+
+    `readline` calls this function with state 0, 1, 2, ... until it returns None
+
+    The first time it is called with a given text, it computes the list of
+    possible completions and stores it to _COMPLETION_LIST, then it return the
+    item with index state from that list, or None if there are no more items.
+    '''
     if state:
-        if state < len(_completion__list):
-            return _completion__list[state]
+        if state < len(_COMPLETION__LIST):
+            return _COMPLETION__LIST[state]
         return None
-    _completion__list.clear()
+    _COMPLETION__LIST.clear()
     if not text:
-        _completion__list.extend(list_executables())
+        _COMPLETION__LIST.extend(list_executables())
     elif text.lstrip()[:1] in ('-', '+'):
-        _completion__list.extend(list_hosts(text))
+        _COMPLETION__LIST.extend(list_hosts(text))
     elif text in '..' or '/' in text:
-        _completion__list.extend(list_path(text))
+        _COMPLETION__LIST.extend(list_path(text))
     else:
-        _completion__list.extend(list_executables(text))
-    with open('readline.log', 'a') as file:
-        file.write(f'{_completion__list = }\n')
-    return _completion__list[0]
+        _COMPLETION__LIST.extend(list_executables(text))
+    return _COMPLETION__LIST[0]
 
 
 def setup_readline():
