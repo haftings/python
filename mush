@@ -17,7 +17,6 @@ from threading import Thread
 # TODO: Ctrl+C should cancel SSH session(s) if running, instead of whole REPL
 # TODO: `-n` option to limit concurrent session count
 # TODO: path completions
-# TODO: _HiStOrY_V2_ and escaping for BSD libedit support on MacOS
 
 RE_HOST_SPLIT = re.compile(r'[ \t\n,;]+')
 RE_META_CMD = re.compile(r'^\s*%\s*(.*)')
@@ -124,7 +123,8 @@ def setup_readline():
     atexit.register(readline.write_history_file, path)
     readline.set_completer(completion)
     readline.set_completer_delims('')
-    readline.parse_and_bind('tab: complete')
+    readline.parse_and_bind('tab: complete')  # GNU readline support
+    readline.parse_and_bind('bind ^I rl_complete')  # BSD libedit support
 
 
 def format(host: str, code: int, text: str) -> str:
