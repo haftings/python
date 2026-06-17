@@ -17,6 +17,7 @@ from threading import Thread
 # TODO: Ctrl+C should cancel SSH session(s) if running, instead of whole REPL
 # TODO: `-n` option to limit concurrent session count
 # TODO: path completions
+# TODO: _HiStOrY_V2_ and escaping for BSD libedit support on MacOS
 
 RE_HOST_SPLIT = re.compile(r'[ \t\n,;]+')
 RE_META_CMD = re.compile(r'^\s*%\s*(.*)')
