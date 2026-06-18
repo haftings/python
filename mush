@@ -127,6 +127,15 @@ def completion(text: str, state: int):
     return _COMPLETION__LIST[0]
 
 
+def get_readline_backend() -> str:
+    '''Get readline backend `'gnu_readline'` (GNU), `'libedit'` BSD, or `'?'`'''
+    if 'libedit' in (doc := getattr(readline, '__doc__', '').lower()):
+        return 'libedit'
+    elif 'readline' in doc.lower():
+        return 'gnu_readline'
+    return 'libedit' if 'libedit' in getattr(readline, '__file__', '') else '?'
+
+
 def setup_readline():
     '''Set up the readline module (call this only once!)'''
     if os.path.isfile(path := os.path.expanduser('~/.inputrc')):
@@ -136,8 +145,11 @@ def setup_readline():
     atexit.register(readline.write_history_file, path)
     readline.set_completer(completion)
     readline.set_completer_delims(' \t\n')
-    readline.parse_and_bind('tab: complete')  # GNU readline support
-    readline.parse_and_bind('bind ^I rl_complete')  # BSD libedit support
+    if get_readline_backend() == 'libedit':
+        readline.parse_and_bind('bind ^I rl_complete')
+    else:
+        readline.parse_and_bind('tab: complete')
+    
 
 
 def format(host: str, code: int, text: str) -> str:
