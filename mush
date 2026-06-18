@@ -110,11 +110,20 @@ def completion(text: str, state: int):
             return _COMPLETION__LIST[state]
         return None
     _COMPLETION__LIST.clear()
+    prefix = ''
+    completions = []
     if r := RE_MOD_HOSTS.match(text):
-        _COMPLETION__LIST.extend(r[1] + host for host in get_hosts(r[3]))
+        prefix = r[1]
+        completions = get_hosts(r[3])
     elif r := RE_COMPLETION.match(text):
-        _COMPLETION__LIST.extend(r[1] + exec for exec in get_executables(r[2]))
-        _COMPLETION__LIST.extend(r[1] + path for path in get_paths(r[2]))
+        prefix = r[1]
+        completions = get_executables(r[2]) + get_paths(r[2])
+    if len(completions) > 1:
+        _COMPLETION__LIST.extend(prefix + c for c in completions)
+    elif completions:
+        _COMPLETION__LIST.append(prefix + completions[0])
+    else:
+        return None
     return _COMPLETION__LIST[0]
 
 
@@ -126,7 +135,7 @@ def setup_readline():
         readline.read_history_file(path)
     atexit.register(readline.write_history_file, path)
     readline.set_completer(completion)
-    readline.set_completer_delims('')
+    readline.set_completer_delims(' \t\n')
     readline.parse_and_bind('tab: complete')  # GNU readline support
     readline.parse_and_bind('bind ^I rl_complete')  # BSD libedit support
 
