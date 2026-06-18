@@ -16,12 +16,16 @@ from threading import Thread
 
 # TODO: Ctrl+C should cancel SSH session(s) if running, instead of whole REPL
 # TODO: `-n` option to limit concurrent session count
-# TODO: path completions
+# TODO: list last-world-only completions when there are multiple possibilities
 
 RE_HOST_SPLIT = re.compile(r'[ \t\n,;]+')
 RE_META_CMD = re.compile(r'^\s*%\s*(.*)')
 RE_IGNORE_PREFIX = re.compile(r'^\s*(?:\$\s+)?', re.M)
 RE_EXIT = re.compile(r'^\s*exit\s*(?:#.*)?$')
+RE_MOD_HOSTS = re.compile(r'^(\ *([+-])\ *)(.*)')
+RE_COMPLETION = re.compile(
+    r'^(.*?)(?:^|(?<=[\t\ \n\(\)\[\]\{\}\:\;\&]))([^\ ]*$)'
+)
 
 
 def run_ssh(host: str, cmd: str, q: Queue[tuple[int, str, CompletedProcess]]):
@@ -43,7 +47,7 @@ def _run_ssh(
     )))
 
 
-def list_executables(prefix: str = '') -> list[str]:
+def get_executables(prefix: str = '') -> list[str]:
     '''List executables in path'''
     results = set()
     for dir in os.get_exec_path():
@@ -62,7 +66,7 @@ def list_executables(prefix: str = '') -> list[str]:
     return [results[0] + ' '] if len(results) == 1 else results
 
 
-def list_path(prefix: str = '') -> list[str]:
+def get_paths(prefix: str = '') -> list[str]:
     '''List paths starting with prefix'''
     dir, isdir, prefix = prefix.rpartition('/')
     dir += isdir
@@ -75,7 +79,7 @@ def list_path(prefix: str = '') -> list[str]:
         return []
 
 
-def list_hosts(prefix: str = '') -> list[str]:
+def get_hosts(prefix: str = '') -> list[str]:
     '''List hosts in the ~/.ssh/config'''
     prefix = prefix[1:]
     hosts = {'localhost'} if 'localhost'.startswith(prefix) else set()
@@ -106,14 +110,11 @@ def completion(text: str, state: int):
             return _COMPLETION__LIST[state]
         return None
     _COMPLETION__LIST.clear()
-    if not text:
-        _COMPLETION__LIST.extend(list_executables())
-    elif text.lstrip()[:1] in ('-', '+'):
-        _COMPLETION__LIST.extend(list_hosts(text))
-    elif text in '..' or '/' in text:
-        _COMPLETION__LIST.extend(list_path(text))
-    else:
-        _COMPLETION__LIST.extend(list_executables(text))
+    if r := RE_MOD_HOSTS.match(text):
+        _COMPLETION__LIST.extend(r[1] + host for host in get_hosts(r[3]))
+    elif r := RE_COMPLETION.match(text):
+        _COMPLETION__LIST.extend(r[1] + exec for exec in get_executables(r[2]))
+        _COMPLETION__LIST.extend(r[1] + path for path in get_paths(r[2]))
     return _COMPLETION__LIST[0]
 
 
